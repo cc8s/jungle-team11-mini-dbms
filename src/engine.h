@@ -27,6 +27,17 @@ const char *engine_warning(const Engine *engine, int index);
 /* 이름이 name 인 테이블 (인덱스·재구축 시간 조회, 테스트·벤치마크용). 없으면 NULL */
 const Table *engine_find_table(const Engine *engine, const char *name);
 
+/* 열린 테이블 수와 index 번째 테이블 (0 <= index < count). 목록과 스키마 (이름, 컬럼) 는 열린 뒤
+ * 바뀌지 않으므로 락 없이 읽어도 된다 */
+int engine_table_count(const Engine *engine);
+const Table *engine_table_at(const Engine *engine, int index);
+
+/* table 의 현재 행 수. INSERT 와 동시에 불릴 수 있어서 실행 락을 잡고 읽는다 (/tables 용) */
+int32_t engine_record_count(Engine *engine, const Table *table);
+
+/* 이 빌드의 락 방식 이름 ("GLOBAL") */
+const char *engine_lock_mode_name(void);
+
 /* 여러 스레드가 같은 엔진으로 engine_execute 를 동시에 불러도 된다 (테이블을 읽고 쓰는 실행 단계는
  * 엔진 안의 락이 감싼다). engine_open / engine_close 는 서버 시작 전·종료 후 한 스레드에서만 부른다.
  *

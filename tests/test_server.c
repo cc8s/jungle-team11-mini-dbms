@@ -21,6 +21,8 @@
 #define QUICK_CLOSE_CLIENTS 100
 #define HELD_TIMEOUT_MS 1000 /* 503 테스트: 붙잡힌 연결이 타임아웃되기 전에 나머지 연결이 끝나면 된다 */
 #define HEALTH_REQUEST "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+#define DEFAULT_TEST_WORKERS 4 /* server_default_options 의 값 */
+#define DEFAULT_TEST_QUEUE 64
 
 /* 테스트 하나가 띄운 서버: 엔진 + 서버 + accept 루프 스레드 */
 typedef struct {
@@ -533,6 +535,171 @@ static void test_concurrent_inserts(void)
     stop_server(&ts);
 }
 
+/* ---- S38 /tables, /stats ---- */
+
+#define ORDERS_SQL "CREATE TABLE orders (id INT, item VARCHAR(8));"
+#define LOAD_INSERTERS 4
+#define LOAD_INSERTS 100
+#define LOAD_POLLS 50
+
+static int64_t json_number(const char *json, const char *field)
+{
+    char key[64];
+    snprintf(key, sizeof(key), "\"%s\":", field);
+    const char *at = strstr(json, key);
+    CHECK(at != NULL);
+    long long value = -1;
+    CHECK(sscanf(at + strlen(key), "%lld", &value) == 1);
+    return value;
+}
+
+/* T38-01 */
+static void test_tables_lists_schema(void)
+{
+    ServerOptions options = server_default_options();
+    TestServer ts;
+    start_server_on(&ts, &options, USERS_SQL ORDERS_SQL);
+    Response response;
+    send_request(ts.port, "GET /tables HTTP/1.1\r\n\r\n", &response);
+    CHECK(response.status == 200);
+    CHECK(strncmp(response.body, "{\"ok\":true,\"tables\":[", 21) == 0);
+    const char *users = "{\"name\":\"users\",\"columns\":["
+                        "{\"name\":\"id\",\"type\":\"INT\",\"size\":4},"
+                        "{\"name\":\"name\",\"type\":\"VARCHAR\",\"size\":32},"
+                        "{\"name\":\"age\",\"type\":\"INT\",\"size\":4}],\"row_count\":0}";
+    const char *orders = "{\"name\":\"orders\",\"columns\":["
+                         "{\"name\":\"id\",\"type\":\"INT\",\"size\":4},"
+                         "{\"name\":\"item\",\"type\":\"VARCHAR\",\"size\":8}],\"row_count\":0}";
+    CHECK(strstr(response.body, users) != NULL); /* 테이블 순서는 디렉터리 순서라 정해져 있지 않다 */
+    CHECK(strstr(response.body, orders) != NULL);
+    stop_server(&ts);
+}
+
+/* T38-02 */
+static void test_tables_row_count(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Response response;
+    for (int i = 0; i < 3; i++)
+        post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES ('kim', 25)\"}", &response);
+    send_request(ts.port, "GET /tables HTTP/1.1\r\n\r\n", &response);
+    CHECK(json_number(response.body, "row_count") == 3);
+    stop_server(&ts);
+}
+
+/* E38-01 */
+static void test_tables_empty(void)
+{
+    TestServer ts;
+    start_server(&ts);
+    Response response;
+    send_request(ts.port, "GET /tables HTTP/1.1\r\n\r\n", &response);
+    CHECK(response.status == 200);
+    CHECK_STR_EQ(response.body, "{\"ok\":true,\"tables\":[]}");
+    stop_server(&ts);
+}
+
+/* T38-03 */
+static void test_stats_counts_requests(void)
+{
+    TestServer ts;
+    start_server(&ts);
+    Response response;
+    for (int i = 0; i < 5; i++)
+        send_request(ts.port, HEALTH_REQUEST, &response);
+    send_request(ts.port, "GET /stats HTTP/1.1\r\n\r\n", &response);
+    CHECK(response.status == 200);
+    CHECK(json_number(response.body, "requests_total") >= 5);
+    CHECK(json_number(response.body, "errors_total") == 0);
+    CHECK(json_number(response.body, "rejected_total") == 0);
+    CHECK(json_number(response.body, "queue_length") >= 0);
+    CHECK(json_number(response.body, "queue_capacity") ==
+          DEFAULT_TEST_QUEUE);
+    CHECK(json_number(response.body, "workers") == DEFAULT_TEST_WORKERS);
+    CHECK(json_number(response.body, "uptime_ms") >= 0);
+    CHECK(strstr(response.body, "\"lock_mode\":\"GLOBAL\"") != NULL);
+    stop_server(&ts);
+}
+
+/* E38-02 */
+static void test_stats_counts_errors_and_rejections(void)
+{
+    ServerOptions options = server_default_options();
+    options.worker_count = 1;
+    options.queue_capacity = 1;
+    options.read_timeout_ms = HELD_TIMEOUT_MS;
+    TestServer ts;
+    start_server_with(&ts, &options);
+    Response response;
+    send_request(ts.port, "GET /nope HTTP/1.1\r\n\r\n", &response);  /* 404 */
+    send_request(ts.port, "PUT /health HTTP/1.1\r\n\r\n", &response); /* 405 */
+    int fds[FLOOD_CLIENTS];                                           /* 503 을 만든다 */
+    for (int i = 0; i < FLOOD_CLIENTS; i++)
+        fds[i] = connect_to(ts.port);
+    for (int i = 0; i < FLOOD_CLIENTS; i++) {
+        read_response(fds[i], &response);
+        close(fds[i]);
+    }
+    send_request(ts.port, "GET /stats HTTP/1.1\r\n\r\n", &response);
+    int64_t errors = json_number(response.body, "errors_total");
+    int64_t rejected = json_number(response.body, "rejected_total");
+    /* 404, 405 와 flood 연결 각각이 408 (에러) 또는 503 (거절) 중 하나로 세어진다 */
+    CHECK(errors + rejected == 2 + FLOOD_CLIENTS);
+    CHECK(rejected >= FLOOD_CLIENTS - 2);
+    stop_server(&ts);
+}
+
+typedef struct {
+    int port;
+    bool is_poller; /* false 면 INSERT, true 면 /tables·/stats 를 번갈아 읽는다 */
+} LoadClient;
+
+static void *run_load_client(void *arg)
+{
+    LoadClient *client = arg;
+    Response *response = malloc(sizeof(*response));
+    CHECK(response != NULL);
+    int64_t last_rows = 0;
+    int rounds = client->is_poller ? LOAD_POLLS : LOAD_INSERTS;
+    for (int i = 0; i < rounds; i++) {
+        if (!client->is_poller) {
+            post_query(client->port, "{\"sql\":\"INSERT INTO users VALUES ('t', 1)\"}", response);
+            CHECK(response->status == 200);
+            continue;
+        }
+        send_request(client->port, "GET /tables HTTP/1.1\r\n\r\n", response);
+        int64_t rows = json_number(response->body, "row_count");
+        CHECK(rows >= last_rows && rows <= LOAD_INSERTERS * LOAD_INSERTS); /* 줄지 않고 범위 안 */
+        last_rows = rows;
+        send_request(client->port, "GET /stats HTTP/1.1\r\n\r\n", response);
+        CHECK(json_number(response->body, "requests_total") >= 0);
+        CHECK(json_number(response->body, "queue_length") >= 0);
+    }
+    free(response);
+    return NULL;
+}
+
+/* E38-03 */
+static void test_stats_under_load(void)
+{
+    ServerOptions options = server_default_options();
+    TestServer ts;
+    start_server_on(&ts, &options, USERS_SQL);
+    LoadClient clients[LOAD_INSERTERS + 2];
+    pthread_t threads[LOAD_INSERTERS + 2];
+    for (int i = 0; i < LOAD_INSERTERS + 2; i++) {
+        clients[i] = (LoadClient){ts.port, i >= LOAD_INSERTERS};
+        CHECK(pthread_create(&threads[i], NULL, run_load_client, &clients[i]) == 0);
+    }
+    for (int i = 0; i < LOAD_INSERTERS + 2; i++)
+        CHECK(pthread_join(threads[i], NULL) == 0);
+    Response response;
+    send_request(ts.port, "GET /tables HTTP/1.1\r\n\r\n", &response);
+    CHECK(json_number(response.body, "row_count") == LOAD_INSERTERS * LOAD_INSERTS);
+    stop_server(&ts);
+}
+
 int main(void)
 {
     printf("test_server\n");
@@ -555,6 +722,12 @@ int main(void)
     RUN(test_query_too_large);
     RUN(test_query_io_error);
     RUN(test_concurrent_inserts);
+    RUN(test_tables_lists_schema);
+    RUN(test_tables_row_count);
+    RUN(test_tables_empty);
+    RUN(test_stats_counts_requests);
+    RUN(test_stats_counts_errors_and_rejections);
+    RUN(test_stats_under_load);
     TEST_DONE();
     return 0;
 }

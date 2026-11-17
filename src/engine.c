@@ -16,6 +16,7 @@
 #define INITIAL_TABLE_CAPACITY 8
 #define MS_PER_SECOND 1000.0
 #define NS_PER_MS 1000000.0
+#define LOCK_MODE_NAME "GLOBAL" /* 실행 단계 전체를 뮤텍스 하나로 (S40 에서 테이블 RW 락 추가) */
 
 struct Engine {
     Table **tables;
@@ -185,6 +186,29 @@ const char *engine_warning(const Engine *engine, int index)
 const Table *engine_find_table(const Engine *engine, const char *name)
 {
     return validator_find_table(engine->tables, engine->table_count, name);
+}
+
+int engine_table_count(const Engine *engine)
+{
+    return engine->table_count;
+}
+
+const Table *engine_table_at(const Engine *engine, int index)
+{
+    return engine->tables[index];
+}
+
+int32_t engine_record_count(Engine *engine, const Table *table)
+{
+    pthread_mutex_lock(&engine->execute_mutex);
+    int32_t count = table_record_count(table);
+    pthread_mutex_unlock(&engine->execute_mutex);
+    return count;
+}
+
+const char *engine_lock_mode_name(void)
+{
+    return LOCK_MODE_NAME;
 }
 
 /* ---- 실행 ---- */

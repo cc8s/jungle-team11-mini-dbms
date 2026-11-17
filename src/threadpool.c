@@ -160,6 +160,14 @@ bool threadpool_submit(ThreadPool *pool, int connfd)
     return is_accepted;
 }
 
+int threadpool_queue_length(ThreadPool *pool)
+{
+    pthread_mutex_lock(&pool->mutex);
+    int length = job_queue_count(pool->queue);
+    pthread_mutex_unlock(&pool->mutex);
+    return length;
+}
+
 /* 종료 순서: 플래그 → broadcast → join → 해제.
  * broadcast 로 잠든 워커를 모두 깨우고, 워커는 큐를 비운 뒤 스스로 나온다 (wait_for_job).
  * join 이 끝나야 아무도 큐·뮤텍스를 쓰지 않으므로 그다음에만 해제한다. */

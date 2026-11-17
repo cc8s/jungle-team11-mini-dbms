@@ -22,6 +22,9 @@ ThreadPool *threadpool_create(int worker_count, int queue_capacity, ThreadPoolHa
  * (호출한 쪽이 503 을 보내고 연결을 닫는다 — 백프레셔). 여러 스레드에서 동시에 불러도 안전하다. */
 bool threadpool_submit(ThreadPool *pool, int connfd);
 
+/* 지금 큐에서 기다리는 연결 수 (/stats 용). 뮤텍스를 잡고 읽는다 */
+int threadpool_queue_length(ThreadPool *pool);
+
 /* 종료 표시 → 워커를 모두 깨움 → join → 해제. NULL 이면 아무 일도 하지 않는다.
  * 큐에 이미 들어온 fd 는 워커가 모두 처리한 뒤에 돌아온다. 종료가 시작된 뒤의 submit 은 false.
  * shutdown 이 진행 중일 때 (워커 join 을 기다리는 동안) 다른 스레드의 submit 은 false 를 받는다.
