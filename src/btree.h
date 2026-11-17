@@ -41,4 +41,11 @@ int64_t btree_size(const BTree *tree);
 /* 루트에서 리프까지 노드 수. 리프 하나뿐인 트리 (빈 트리 포함) 는 1 */
 int btree_height(const BTree *tree);
 
+/* 테스트·디버깅용 불변식 검사. 모두 만족하면 true:
+ * - 노드 안 키 오름차순, 키 개수 범위 (루트 제외 최소 ⌈ORDER/2⌉ - 1)
+ * - 내부 노드: 자식 수 = 키 수 + 1, 자식의 키가 구분 키 구간 안에 있음
+ * - 모든 리프의 깊이가 같고 = height
+ * - 리프 연결 리스트가 왼쪽부터 오름차순이고 키 개수 합 = size */
+bool btree_check(const BTree *tree);
+
 #endif

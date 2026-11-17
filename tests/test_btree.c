@@ -23,6 +23,13 @@ static BTree *create_tree(void)
     return tree;
 }
 
+/* 모든 트리 테스트는 끝에서 불변식을 함께 검사한 뒤 해제한다 */
+static void destroy_checked(BTree *tree)
+{
+    CHECK(btree_check(tree));
+    btree_destroy(tree);
+}
+
 /* 루트 리프 안의 키가 엄격한 오름차순인지 */
 static bool is_root_leaf_sorted(const BTree *tree)
 {
@@ -42,7 +49,7 @@ static void test_create_empty_tree(void)
     CHECK(btree_height(tree) == 1);
     CHECK(tree->root->is_leaf);
     CHECK(tree->root->num_keys == 0);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* T20-02 */
@@ -54,7 +61,7 @@ static void test_insert_one_and_search(void)
     CHECK(btree_search(tree, 7, &value));
     CHECK(value == 700);
     CHECK(btree_size(tree) == 1);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* T20-03 */
@@ -72,7 +79,7 @@ static void test_insert_shuffled_keeps_leaf_sorted(void)
     }
     CHECK(btree_size(tree) == SHUFFLED_COUNT);
     CHECK(is_root_leaf_sorted(tree));
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* T20-04 */
@@ -86,7 +93,7 @@ static void test_value_is_record_offset(void)
         CHECK(btree_search(tree, id, &value));
         CHECK(value == record_offset(id));
     }
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E20-01 */
@@ -96,7 +103,7 @@ static void test_search_empty_tree(void)
     uint64_t value = SENTINEL_VALUE;
     CHECK(!btree_search(tree, 1, &value));
     CHECK(value == SENTINEL_VALUE);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E20-02 */
@@ -111,7 +118,7 @@ static void test_search_missing_keys(void)
     CHECK(!btree_search(tree, 35, &value)); /* 가장 큰 키보다 큼 */
     CHECK(!btree_search(tree, 15, &value)); /* 사이 */
     CHECK(value == SENTINEL_VALUE);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E20-03 */
@@ -124,7 +131,7 @@ static void test_insert_duplicate_key(void)
     uint64_t value = 0;
     CHECK(btree_search(tree, 3, &value));
     CHECK(value == 300);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E20-04 */
@@ -141,7 +148,7 @@ static void test_extreme_keys(void)
         CHECK(value == (uint64_t)i);
     }
     CHECK(is_root_leaf_sorted(tree));
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E20-05 */
@@ -167,7 +174,7 @@ static void test_fill_leaf_without_split(void)
         CHECK(btree_search(tree, key, &value));
         CHECK(value == record_offset(key));
     }
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* ---- S21 리프 split ---- */
@@ -252,7 +259,7 @@ static void test_first_split_grows_height(void)
     CHECK(btree_height(tree) == 2);
     CHECK(btree_size(tree) == BTREE_ORDER);
     check_all_found(tree, 1, BTREE_ORDER, 1);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* T21-02 */
@@ -263,7 +270,7 @@ static void test_first_split_root_key(void)
         CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
     check_first_split_shape(tree);
     CHECK(tree->root->keys[0] == SPLIT_LEFT_COUNT + 1);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* T21-03 */
@@ -279,7 +286,7 @@ static void test_leaf_chain_is_sorted(void)
     CHECK(count_leaves(tree) >= 2);
     CHECK(is_leaf_chain_sorted(tree));
     check_all_found(tree, 1, key_count, 1);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* T21-04 */
@@ -290,7 +297,7 @@ static void test_split_key_counts(void)
         CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
     CHECK(tree->root->children[0]->num_keys == SPLIT_LEFT_COUNT);
     CHECK(tree->root->children[1]->num_keys == SPLIT_RIGHT_COUNT);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E21-01 */
@@ -299,10 +306,12 @@ static void test_split_new_key_in_left_half(void)
     BTree *tree = create_full_even_leaf();
     CHECK(btree_insert(tree, 3, 3) == BTREE_OK); /* 2 와 4 사이: 왼쪽 절반 */
     check_first_split_shape(tree);
-    CHECK(tree->root->children[0]->keys[1] == 3);
+    /* ORDER = 3 이면 왼쪽에 키가 1 개만 남아 3 은 오른쪽 맨 앞으로 간다 (왼쪽 절반 삽입이 성립 안 함) */
+    if (SPLIT_LEFT_COUNT >= 2)
+        CHECK(tree->root->children[0]->keys[1] == 3);
     CHECK(tree->root->children[0]->num_keys == SPLIT_LEFT_COUNT);
     check_all_found(tree, 2, 2 * BTREE_MAX_KEYS, 2);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E21-02 */
@@ -315,7 +324,7 @@ static void test_split_new_key_at_right_front(void)
     check_first_split_shape(tree);
     CHECK(tree->root->keys[0] == new_key);
     CHECK(tree->root->children[1]->keys[0] == new_key);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E21-03 */
@@ -330,7 +339,7 @@ static void test_split_ascending_leaves_left_half_full(void)
     CHECK(left->num_keys == SPLIT_LEFT_COUNT); /* 꽉 차지 않고 반만 참 */
     CHECK(left->keys[left->num_keys - 1] == SPLIT_LEFT_COUNT);
     CHECK(right->keys[right->num_keys - 1] == BTREE_ORDER);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E21-04 */
@@ -342,7 +351,7 @@ static void test_split_descending(void)
     check_first_split_shape(tree);
     CHECK(leftmost_leaf(tree)->keys[0] == 1);
     check_all_found(tree, 1, BTREE_ORDER, 1);
-    btree_destroy(tree);
+    destroy_checked(tree);
 }
 
 /* E21-05 */
@@ -370,7 +379,183 @@ static void test_split_middle_leaf_keeps_chain(void)
     CHECK(right->next == NULL);
     CHECK(is_leaf_chain_sorted(tree));
     check_all_found(tree, KEY_GAP, last_key, KEY_GAP);
-    btree_destroy(tree);
+    destroy_checked(tree);
+}
+
+/* ---- S22 내부 노드 split, 루트 성장, 불변식 검사 ---- */
+
+#define CASCADE_SPLIT_NODE_COUNT 3 /* 리프 + 내부 루트 split + 새 루트 */
+
+/* 오름차순으로 target_height 가 될 때까지 넣고 마지막 키를 돌려준다.
+ * 한 번에 높이가 1 넘게 늘면 실패 (E22-01) */
+static int32_t insert_ascending_until_height(BTree *tree, int target_height)
+{
+    int32_t key = (int32_t)btree_size(tree);
+    while (btree_height(tree) < target_height) {
+        int height_before = btree_height(tree);
+        key++;
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+        CHECK(btree_height(tree) - height_before <= 1);
+    }
+    return key;
+}
+
+static bool node_contains_key(const BNode *node, int32_t key)
+{
+    for (int i = 0; i < node->num_keys; i++) {
+        if (node->keys[i] == key)
+            return true;
+    }
+    return false;
+}
+
+/* T22-01 */
+static void test_grow_to_height_three(void)
+{
+    BTree *tree = create_tree();
+    insert_ascending_until_height(tree, 3);
+    CHECK(btree_height(tree) == 3);
+    CHECK(btree_check(tree));
+    destroy_checked(tree);
+}
+
+/* T22-02 */
+static void test_internal_split_moves_middle_key_up(void)
+{
+    BTree *tree = create_tree();
+    insert_ascending_until_height(tree, 3);
+    const BNode *root = tree->root;
+    CHECK(root->num_keys == 1);
+    int32_t up_key = root->keys[0];
+    CHECK(!root->children[0]->is_leaf);
+    CHECK(!node_contains_key(root->children[0], up_key)); /* 올라간 키는 양쪽에 없음 */
+    CHECK(!node_contains_key(root->children[1], up_key));
+    uint64_t value = 0;
+    CHECK(btree_search(tree, up_key, &value)); /* 데이터는 리프에 그대로 */
+    CHECK(value == (uint64_t)up_key);
+    destroy_checked(tree);
+}
+
+/* T22-03 */
+static void test_height_three_all_found(void)
+{
+    BTree *tree = create_tree();
+    int32_t last_key = insert_ascending_until_height(tree, 3);
+    check_all_found(tree, 1, last_key, 1);
+    destroy_checked(tree);
+}
+
+/* T22-04 */
+static void test_check_detects_broken_tree(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t key = 1; key <= SHUFFLED_COUNT; key++)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    CHECK(btree_check(tree));
+
+    /* 테스트 전용 조작: 리프 안의 두 키 순서를 바꾼다 */
+    BNode *leaf = tree->root;
+    while (!leaf->is_leaf)
+        leaf = leaf->children[0];
+    int32_t saved = leaf->keys[0];
+    leaf->keys[0] = leaf->keys[1];
+    leaf->keys[1] = saved;
+    CHECK(!btree_check(tree));
+
+    leaf->keys[1] = leaf->keys[0]; /* 원래대로 돌린다 */
+    leaf->keys[0] = saved;
+    destroy_checked(tree);
+}
+
+/* E22-01 */
+static void test_cascading_root_split(void)
+{
+    BTree *tree = create_tree();
+    insert_ascending_until_height(tree, 2);
+    /* 높이 2 → 3 이 되는 삽입은 리프 split 이 내부 루트 split 으로 번지는 연쇄 split 이다 */
+    int leaves_before = 0;
+    while (btree_height(tree) == 2) {
+        leaves_before = count_leaves(tree);
+        int32_t key = (int32_t)btree_size(tree) + 1;
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    }
+    CHECK(btree_height(tree) == 3);
+    CHECK(count_leaves(tree) == leaves_before + 1);
+    destroy_checked(tree);
+}
+
+/* E22-02 */
+static void test_internal_split_on_leftmost_path(void)
+{
+    BTree *tree = create_tree();
+    int32_t key = INT32_MAX; /* 내림차순: 늘 가장 왼쪽 경로에 삽입 */
+    while (btree_height(tree) < 3) {
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+        key--;
+    }
+    CHECK(btree_check(tree));
+    CHECK(leftmost_leaf(tree)->keys[0] == key + 1);
+    /* INT32_MAX 까지 포함하려고 int64_t 로 돈다 (int32_t 면 ++ 에서 넘침) */
+    for (int64_t found = (int64_t)key + 1; found <= INT32_MAX; found++) {
+        uint64_t value = 0;
+        CHECK(btree_search(tree, (int32_t)found, &value));
+        CHECK(value == (uint64_t)found);
+    }
+    destroy_checked(tree);
+}
+
+/* E22-03 */
+static void test_internal_split_on_rightmost_path(void)
+{
+    BTree *tree = create_tree();
+    int32_t last_key = insert_ascending_until_height(tree, 3);
+    const BNode *node = tree->root;
+    while (!node->is_leaf)
+        node = node->children[node->num_keys];
+    CHECK(node->keys[node->num_keys - 1] == last_key); /* 가장 오른쪽 리프에 마지막 키 */
+    CHECK(node->next == NULL);
+    check_all_found(tree, 1, last_key, 1);
+    destroy_checked(tree);
+}
+
+/* 다음 오름차순 삽입이 리프 → 내부 루트 → 새 루트 로 연쇄 split 되는 직전 상태를 만든다 */
+static BTree *create_tree_before_cascade(void)
+{
+    BTree *tree = create_tree();
+    insert_ascending_until_height(tree, 2);
+    for (;;) {
+        const BNode *root = tree->root;
+        const BNode *rightmost = root->children[root->num_keys];
+        if (root->num_keys == BTREE_MAX_KEYS && rightmost->num_keys == BTREE_MAX_KEYS)
+            return tree;
+        int32_t key = (int32_t)btree_size(tree) + 1;
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+        CHECK(btree_height(tree) == 2);
+    }
+}
+
+/* E22-04 */
+static void test_alloc_failure_keeps_tree(void)
+{
+    for (int budget = 0; budget < CASCADE_SPLIT_NODE_COUNT; budget++) {
+        BTree *tree = create_tree_before_cascade();
+        int64_t size_before = btree_size(tree);
+        int32_t key = (int32_t)size_before + 1;
+
+        tree->alloc_budget = budget; /* budget 번째 다음 할당부터 실패 */
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_NO_MEMORY);
+        CHECK(btree_size(tree) == size_before);
+        CHECK(btree_height(tree) == 2);
+        uint64_t value = SENTINEL_VALUE;
+        CHECK(!btree_search(tree, key, &value));
+        CHECK(btree_check(tree));
+        check_all_found(tree, 1, (int32_t)size_before, 1);
+
+        tree->alloc_budget = BTREE_UNLIMITED_ALLOCS; /* 할당이 되면 같은 삽입이 성공 */
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+        CHECK(btree_height(tree) == 3);
+        destroy_checked(tree);
+    }
 }
 
 int main(void)
@@ -395,6 +580,14 @@ int main(void)
     RUN(test_split_ascending_leaves_left_half_full);
     RUN(test_split_descending);
     RUN(test_split_middle_leaf_keeps_chain);
+    RUN(test_grow_to_height_three);
+    RUN(test_internal_split_moves_middle_key_up);
+    RUN(test_height_three_all_found);
+    RUN(test_check_detects_broken_tree);
+    RUN(test_cascading_root_split);
+    RUN(test_internal_split_on_leftmost_path);
+    RUN(test_internal_split_on_rightmost_path);
+    RUN(test_alloc_failure_keeps_tree);
     TEST_DONE();
     return 0;
 }

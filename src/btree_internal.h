@@ -19,10 +19,15 @@ typedef struct BNode {
     struct BNode *next; /* 리프: 오른쪽 형제 (범위 순회용), 가장 오른쪽은 NULL */
 } BNode;
 
+#define BTREE_UNLIMITED_ALLOCS -1
+
 struct BTree {
     BNode *root;
     int64_t size;
     int height;
+    /* 테스트용 할당 실패 주입: 0 이상이면 노드를 그만큼만 더 할당하고 그다음부터 실패한다.
+     * 전역 변수 대신 트리 안에 둬서 트리마다 독립적이다. 평소에는 BTREE_UNLIMITED_ALLOCS */
+    int alloc_budget;
 };
 
 #endif
