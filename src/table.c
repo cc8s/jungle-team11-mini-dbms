@@ -180,6 +180,7 @@ struct Table {
     int fd;
     char name[MAX_NAME];
     TableHeader header;
+    int32_t column_offsets[MAX_COLUMNS]; /* 레코드 안에서 각 컬럼이 시작하는 바이트 */
 };
 
 static bool is_valid_column(const ColumnDef *column)
@@ -261,6 +262,15 @@ static ErrorCode load_header(int fd, TableHeader *out_header)
     return is_valid_header(out_header, info.st_size) ? ERR_NONE : ERR_CORRUPT;
 }
 
+static void compute_column_offsets(Table *table)
+{
+    int32_t offset = 0;
+    for (int i = 0; i < table->header.column_count; i++) {
+        table->column_offsets[i] = offset;
+        offset += table->header.columns[i].size;
+    }
+}
+
 Table *table_open(const char *path, ErrorCode *out_error)
 {
     Table *table = calloc(1, sizeof(*table));
@@ -278,6 +288,7 @@ Table *table_open(const char *path, ErrorCode *out_error)
         error = load_header(table->fd, &table->header);
     if (error != ERR_NONE)
         goto cleanup;
+    compute_column_offsets(table);
     *out_error = ERR_NONE;
     return table;
 
@@ -325,4 +336,114 @@ bool table_find_column(const Table *table, const char *name, int *out_index)
 int32_t table_record_count(const Table *table)
 {
     return table->header.row_count;
+}
+
+int32_t table_next_id(const Table *table)
+{
+    return table->header.next_id;
+}
+
+int32_t table_record_size(const Table *table)
+{
+    return table->header.record_size;
+}
+
+/* ---- 레코드 ---- */
+
+/* id 번 레코드의 파일 위치. 이 공식은 여기에만 둔다 (CLAUDE.md 불변식) */
+static off_t record_offset(const Table *table, int32_t id)
+{
+    return (off_t)HEADER_SIZE + (off_t)(id - 1) * table->header.record_size;
+}
+
+static ErrorCode encode_field(const ColumnDef *column, const Value *value, uint8_t *field)
+{
+    if (column->type == COL_INT && value->type == VAL_INT) {
+        write_i32_le(field, value->i);
+        return ERR_NONE;
+    }
+    if (column->type == COL_VARCHAR && value->type == VAL_STRING &&
+        value->s.len <= (size_t)column->size) {
+        memset(field, 0, (size_t)column->size);
+        memcpy(field, value->s.ptr, value->s.len);
+        return ERR_NONE;
+    }
+    return ERR_INTERNAL; /* 타입·길이·자리 표시자는 validator 와 바인딩이 이미 걸렀어야 한다 */
+}
+
+ErrorCode table_encode_record(const Table *table, int32_t id, const Value *values,
+                              int value_count, uint8_t *out_record)
+{
+    if (value_count != table->header.column_count - 1)
+        return ERR_INTERNAL;
+    write_i32_le(out_record, id);
+    for (int i = 1; i < table->header.column_count; i++) {
+        ErrorCode error = encode_field(&table->header.columns[i], &values[i - 1],
+                                       out_record + table->column_offsets[i]);
+        if (error != ERR_NONE)
+            return error;
+    }
+    return ERR_NONE;
+}
+
+/* next_id, row_count 는 헤더에서 붙어 있어 8 바이트를 한 번에 쓴다 */
+static bool write_counters(Table *table, int32_t next_id, int32_t row_count)
+{
+    uint8_t bytes[ROW_COUNT_OFFSET + INT_COLUMN_SIZE - NEXT_ID_OFFSET];
+    write_i32_le(bytes, next_id);
+    write_i32_le(bytes + (ROW_COUNT_OFFSET - NEXT_ID_OFFSET), row_count);
+    return write_all_at(table->fd, bytes, sizeof(bytes), NEXT_ID_OFFSET);
+}
+
+/* 순서: 레코드 → 헤더. 중간에 죽으면 파일 끝에 row_count 밖의 레코드가 남을 뿐이고
+ * 열 때 그 부분은 무시된다 (S11, Phase 2 에서 복구). 메모리의 헤더는 두 쓰기가 다 끝난 뒤에만 바꾼다 */
+ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_id)
+{
+    int32_t id = table->header.next_id;
+    if (id == INT32_MAX || table->header.row_count == INT32_MAX)
+        return ERR_OUT_OF_RANGE;
+    if (read_i32_le(record) != id)
+        return ERR_INTERNAL;
+    size_t size = (size_t)table->header.record_size;
+    if (!write_all_at(table->fd, record, size, record_offset(table, id)))
+        return ERR_IO;
+    if (!write_counters(table, id + 1, table->header.row_count + 1))
+        return ERR_IO;
+    table->header.next_id = id + 1;
+    table->header.row_count++;
+    *out_id = id;
+    return ERR_NONE;
+}
+
+ErrorCode table_read_records(const Table *table, int32_t first_id, int32_t count,
+                             uint8_t *out_records)
+{
+    /* int64 로 계산해 first_id + count 가 int32 를 넘어도 범위 검사가 틀리지 않게 한다 */
+    int64_t last_id = (int64_t)first_id + count - 1;
+    if (first_id < 1 || count < 0 || last_id > table->header.row_count)
+        return ERR_INTERNAL;
+    if (count == 0)
+        return ERR_NONE;
+    size_t size = (size_t)count * (size_t)table->header.record_size;
+    if (!read_all_at(table->fd, out_records, size, record_offset(table, first_id)))
+        return ERR_IO;
+    return ERR_NONE;
+}
+
+ErrorCode table_read_record(const Table *table, int32_t id, uint8_t *out_record)
+{
+    return table_read_records(table, id, 1, out_record);
+}
+
+int32_t table_record_int(const Table *table, const uint8_t *record, int column)
+{
+    return read_i32_le(record + table->column_offsets[column]);
+}
+
+const char *table_record_string(const Table *table, const uint8_t *record, int column,
+                                size_t *out_len)
+{
+    const char *field = (const char *)(record + table->column_offsets[column]);
+    *out_len = strnlen(field, (size_t)table->header.columns[column].size);
+    return field;
 }

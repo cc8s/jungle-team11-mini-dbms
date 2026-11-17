@@ -468,6 +468,267 @@ static void test_open_negative_row_count(void)
     table_file_remove(&file);
 }
 
+/* ---- S12: 레코드 직렬화, 쓰기, 읽기 ---- */
+
+#define PEOPLE_SQL "CREATE TABLE people (id INT, name VARCHAR(4), note VARCHAR(6), age INT)"
+#define PEOPLE_RECORD_SIZE 18 /* 4 + 4 + 6 + 4 */
+#define PEOPLE_VALUE_COUNT 3  /* id 를 뺀 값 */
+#define NAME_COLUMN 1
+#define NOTE_COLUMN 2
+#define AGE_COLUMN 3
+
+/* 임시 디렉터리에 people 테이블을 만들고 연다 */
+typedef struct {
+    TableFile file;
+    Table *table;
+} OpenTable;
+
+static OpenTable open_people(void)
+{
+    OpenTable open_table;
+    open_table.file = table_file_make();
+    CreateStmt create = parse_create(PEOPLE_SQL);
+    CHECK(table_create(open_table.file.path, &create) == ERR_NONE);
+    ErrorCode error;
+    open_table.table = table_open(open_table.file.path, &error);
+    CHECK(open_table.table != NULL);
+    return open_table;
+}
+
+static void reopen(OpenTable *open_table)
+{
+    table_close(open_table->table);
+    ErrorCode error;
+    open_table->table = table_open(open_table->file.path, &error);
+    CHECK(open_table->table != NULL);
+}
+
+static void close_people(OpenTable *open_table)
+{
+    table_close(open_table->table);
+    table_file_remove(&open_table->file);
+}
+
+static void encode_person(const Table *table, int32_t id, const char *name, const char *note,
+                          int32_t age, uint8_t *out_record)
+{
+    Value values[PEOPLE_VALUE_COUNT] = {
+        value_from_string(name, strlen(name)),
+        value_from_string(note, strlen(note)),
+        value_from_int(age),
+    };
+    CHECK(table_encode_record(table, id, values, PEOPLE_VALUE_COUNT, out_record) == ERR_NONE);
+    for (int i = 0; i < PEOPLE_VALUE_COUNT; i++)
+        value_free(&values[i]);
+}
+
+static int32_t append_person(Table *table, const char *name, const char *note, int32_t age)
+{
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    encode_person(table, table_next_id(table), name, note, age, record);
+    int32_t id = 0;
+    CHECK(table_append_record(table, record, &id) == ERR_NONE);
+    return id;
+}
+
+static void check_string_field(const Table *table, const uint8_t *record, int column,
+                               const char *expected)
+{
+    size_t len = 0;
+    const char *text = table_record_string(table, record, column, &len);
+    CHECK(len == strlen(expected));
+    CHECK(memcmp(text, expected, len) == 0);
+}
+
+static void check_person(const Table *table, const uint8_t *record, int32_t id,
+                         const char *name, const char *note, int32_t age)
+{
+    CHECK(table_record_int(table, record, 0) == id);
+    check_string_field(table, record, NAME_COLUMN, name);
+    check_string_field(table, record, NOTE_COLUMN, note);
+    CHECK(table_record_int(table, record, AGE_COLUMN) == age);
+}
+
+/* T12-01 */ static void test_record_round_trip(void)
+{
+    OpenTable people = open_people();
+    CHECK(table_record_size(people.table) == PEOPLE_RECORD_SIZE);
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    encode_person(people.table, 7, "kim", "hello", 25, record);
+    check_person(people.table, record, 7, "kim", "hello", 25);
+    close_people(&people);
+}
+
+/* T12-02, T12-05 */ static void test_append_three_records(void)
+{
+    OpenTable people = open_people();
+    CHECK(append_person(people.table, "kim", "a", 25) == 1);
+    CHECK(append_person(people.table, "lee", "b", 30) == 2);
+    CHECK(append_person(people.table, "park", "c", 35) == 3);
+    CHECK(table_record_count(people.table) == 3);
+    CHECK(table_next_id(people.table) == 4);
+
+    uint8_t bytes[HEADER_SIZE * 2];
+    CHECK(read_file(people.file.path, bytes, sizeof(bytes)) ==
+          HEADER_SIZE + 3 * PEOPLE_RECORD_SIZE);
+    TableHeader header;
+    table_header_decode(bytes, &header); /* 헤더도 파일에 갱신되었다 */
+    CHECK(header.next_id == 4);
+    CHECK(header.row_count == 3);
+    close_people(&people);
+}
+
+/* T12-03 */ static void test_records_survive_reopen(void)
+{
+    OpenTable people = open_people();
+    append_person(people.table, "kim", "a", 25);
+    append_person(people.table, "lee", "b", 30);
+    reopen(&people);
+    CHECK(table_record_count(people.table) == 2);
+    CHECK(table_next_id(people.table) == 3);
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    CHECK(table_read_record(people.table, 2, record) == ERR_NONE);
+    check_person(people.table, record, 2, "lee", "b", 30);
+    CHECK(append_person(people.table, "park", "c", 35) == 3);
+    close_people(&people);
+}
+
+/* T12-04 */ static void test_read_many_records_at_once(void)
+{
+    OpenTable people = open_people();
+    append_person(people.table, "kim", "a", 25);
+    append_person(people.table, "lee", "b", 30);
+    append_person(people.table, "park", "c", 35);
+    uint8_t records[3 * PEOPLE_RECORD_SIZE];
+    CHECK(table_read_records(people.table, 2, 2, records) == ERR_NONE);
+    check_person(people.table, records, 2, "lee", "b", 30);
+    check_person(people.table, records + PEOPLE_RECORD_SIZE, 3, "park", "c", 35);
+    CHECK(table_read_records(people.table, 1, 3, records) == ERR_NONE);
+    check_person(people.table, records, 1, "kim", "a", 25);
+    close_people(&people);
+}
+
+/* E12-01, E12-02 */ static void test_varchar_full_and_empty(void)
+{
+    OpenTable people = open_people();
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    encode_person(people.table, 1, "abcd", "", 0, record);
+    const uint8_t name_bytes[] = { 'a', 'b', 'c', 'd' };
+    CHECK(memcmp(record + 4, name_bytes, sizeof(name_bytes)) == 0); /* \0 없이 꽉 참 */
+    for (int i = 0; i < 6; i++)
+        CHECK(record[8 + i] == 0); /* 빈 문자열은 모두 \0 */
+    check_person(people.table, record, 1, "abcd", "", 0);
+    close_people(&people);
+}
+
+/* E12-03 */ static void test_varchar_full_of_multibyte(void)
+{
+    OpenTable people = open_people();
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    encode_person(people.table, 1, "a", "가나", 0, record); /* UTF-8 3 바이트 × 2 = 6 */
+    check_string_field(people.table, record, NOTE_COLUMN, "가나");
+    close_people(&people);
+}
+
+/* E12-04 */ static void test_negative_int_round_trip(void)
+{
+    OpenTable people = open_people();
+    append_person(people.table, "a", "", -1);
+    append_person(people.table, "b", "", INT32_MIN);
+    append_person(people.table, "c", "", INT32_MAX);
+    reopen(&people);
+    uint8_t records[3 * PEOPLE_RECORD_SIZE];
+    CHECK(table_read_records(people.table, 1, 3, records) == ERR_NONE);
+    CHECK(table_record_int(people.table, records, AGE_COLUMN) == -1);
+    CHECK(table_record_int(people.table, records + PEOPLE_RECORD_SIZE, AGE_COLUMN) == INT32_MIN);
+    CHECK(table_record_int(people.table, records + 2 * PEOPLE_RECORD_SIZE, AGE_COLUMN) ==
+          INT32_MAX);
+    close_people(&people);
+}
+
+/* E12-05 */ static void test_read_missing_id(void)
+{
+    OpenTable people = open_people();
+    append_person(people.table, "kim", "a", 25);
+    uint8_t records[2 * PEOPLE_RECORD_SIZE];
+    CHECK(table_read_record(people.table, 0, records) == ERR_INTERNAL);
+    CHECK(table_read_record(people.table, 2, records) == ERR_INTERNAL);
+    CHECK(table_read_record(people.table, -1, records) == ERR_INTERNAL);
+    CHECK(table_read_records(people.table, 1, 2, records) == ERR_INTERNAL);
+    CHECK(table_read_records(people.table, 0, 1, records) == ERR_INTERNAL);
+    CHECK(table_read_records(people.table, 1, -1, records) == ERR_INTERNAL);
+    CHECK(table_read_records(people.table, INT32_MAX, INT32_MAX, records) == ERR_INTERNAL);
+    close_people(&people);
+}
+
+/* E12-06 */ static void test_append_when_next_id_is_max(void)
+{
+    TableFile file = table_file_make();
+    CreateStmt create = parse_create(PEOPLE_SQL);
+    TableHeader header;
+    table_header_from_create(&create, &header);
+    header.next_id = INT32_MAX; /* 이 id 를 쓰면 다음 id 가 int32 를 넘는다 */
+    write_table_file(file.path, &header, 0);
+    ErrorCode error;
+    Table *table = table_open(file.path, &error);
+    CHECK(table != NULL);
+
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    encode_person(table, INT32_MAX, "kim", "a", 25, record);
+    int32_t id = 0;
+    CHECK(table_append_record(table, record, &id) == ERR_OUT_OF_RANGE);
+    CHECK(table_next_id(table) == INT32_MAX);
+    CHECK(table_record_count(table) == 0);
+    uint8_t bytes[HEADER_SIZE * 2];
+    CHECK(read_file(file.path, bytes, sizeof(bytes)) == HEADER_SIZE); /* 파일 변경 없음 */
+    table_close(table);
+    table_file_remove(&file);
+}
+
+/* E12-07 */ static void test_read_zero_records(void)
+{
+    OpenTable people = open_people();
+    uint8_t untouched = 0xAB;
+    CHECK(table_read_records(people.table, 1, 0, &untouched) == ERR_NONE); /* 빈 테이블도 */
+    CHECK(untouched == 0xAB);
+    close_people(&people);
+}
+
+static void test_append_rejects_wrong_id(void)
+{
+    OpenTable people = open_people();
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    encode_person(people.table, 5, "kim", "a", 25, record); /* next_id 는 1 */
+    int32_t id = 0;
+    CHECK(table_append_record(people.table, record, &id) == ERR_INTERNAL);
+    CHECK(table_record_count(people.table) == 0);
+    close_people(&people);
+}
+
+static void test_encode_rejects_unbound_values(void)
+{
+    OpenTable people = open_people();
+    uint8_t record[PEOPLE_RECORD_SIZE];
+    Value values[PEOPLE_VALUE_COUNT] = {
+        value_from_string("toolong", strlen("toolong")),
+        value_from_string("", 0),
+        value_from_int(1),
+    };
+    CHECK(table_encode_record(people.table, 1, values, PEOPLE_VALUE_COUNT, record) ==
+          ERR_INTERNAL); /* 길이 검사는 validator 몫이라 여기 오면 버그 */
+    CHECK(table_encode_record(people.table, 1, values, 2, record) == ERR_INTERNAL);
+    value_free(&values[0]);
+    values[0] = value_placeholder(0);
+    CHECK(table_encode_record(people.table, 1, values, PEOPLE_VALUE_COUNT, record) ==
+          ERR_INTERNAL);
+    values[0] = value_from_int(3); /* VARCHAR 칸에 INT */
+    CHECK(table_encode_record(people.table, 1, values, PEOPLE_VALUE_COUNT, record) ==
+          ERR_INTERNAL);
+    for (int i = 0; i < PEOPLE_VALUE_COUNT; i++)
+        value_free(&values[i]);
+    close_people(&people);
+}
+
 int main(void)
 {
     RUN(test_header_round_trip);
@@ -492,6 +753,18 @@ int main(void)
     RUN(test_open_ignores_partial_last_record);
     RUN(test_open_text_file);
     RUN(test_open_without_permission);
+    RUN(test_record_round_trip);
+    RUN(test_append_three_records);
+    RUN(test_records_survive_reopen);
+    RUN(test_read_many_records_at_once);
+    RUN(test_varchar_full_and_empty);
+    RUN(test_varchar_full_of_multibyte);
+    RUN(test_negative_int_round_trip);
+    RUN(test_read_missing_id);
+    RUN(test_append_when_next_id_is_max);
+    RUN(test_read_zero_records);
+    RUN(test_append_rejects_wrong_id);
+    RUN(test_encode_rejects_unbound_values);
     TEST_DONE();
     return 0;
 }

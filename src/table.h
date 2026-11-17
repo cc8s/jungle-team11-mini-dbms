@@ -66,5 +66,40 @@ const ColumnDef *table_column(const Table *table, int index);
 /* 이름이 정확히 같은 컬럼을 찾는다 (이름은 파서가 소문자로 정규화한다). 없으면 false */
 bool table_find_column(const Table *table, const char *name, int *out_index);
 int32_t table_record_count(const Table *table);
+/* 다음 INSERT 가 받을 id */
+int32_t table_next_id(const Table *table);
+/* 레코드 1 개 바이트 수 (컬럼 크기 합) */
+int32_t table_record_size(const Table *table);
+
+/* ---- 레코드 ----
+ * 레코드는 컬럼 순서대로 이어 붙인 table_record_size 바이트다.
+ * INT 는 4 바이트 리틀 엔디언, VARCHAR(n) 은 값을 복사하고 남는 칸을 \0 으로 채운 n 바이트
+ * (n 바이트를 꽉 채운 값은 \0 이 없다). */
+
+/* id 와 id 를 뺀 나머지 컬럼 값 value_count 개를 out_record 에 직렬화한다.
+ * 값은 validator 와 바인딩을 거친 것이어야 한다: 개수·타입이 안 맞거나, 길이를 넘거나,
+ * 자리 표시자가 남아 있으면 호출 측 버그로 보고 ERR_INTERNAL. */
+ErrorCode table_encode_record(const Table *table, int32_t id, const Value *values,
+                              int value_count, uint8_t *out_record);
+
+/* record 를 다음 id 자리에 쓰고 헤더의 next_id, row_count 를 갱신한다.
+ * record 의 id 칸은 table_next_id 여야 한다 (아니면 ERR_INTERNAL).
+ * next_id 가 INT32_MAX 를 넘게 되면 ERR_OUT_OF_RANGE (파일 변경 없음), 쓰기 실패는 ERR_IO. */
+ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_id);
+
+/* id 번 레코드를 out_record (table_record_size 바이트) 에 읽는다. 없는 id 는 ERR_INTERNAL */
+ErrorCode table_read_record(const Table *table, int32_t id, uint8_t *out_record);
+
+/* first_id 부터 count 개를 한 번의 pread 로 out_records 에 이어서 읽는다.
+ * 범위가 1 ~ row_count 밖이면 ERR_INTERNAL. count = 0 이면 아무것도 읽지 않고 성공 */
+ErrorCode table_read_records(const Table *table, int32_t first_id, int32_t count,
+                             uint8_t *out_records);
+
+/* record 의 column 번째 INT 값 */
+int32_t table_record_int(const Table *table, const uint8_t *record, int column);
+/* record 의 column 번째 VARCHAR 값. \0 으로 끝나지 않을 수 있으니 *out_len 만큼만 읽는다.
+ * 돌려준 포인터는 record 안을 가리킨다 */
+const char *table_record_string(const Table *table, const uint8_t *record, int column,
+                                size_t *out_len);
 
 #endif
