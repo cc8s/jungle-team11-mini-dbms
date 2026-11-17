@@ -8,7 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int test_passed = 0;
+/* 테스트 스레드 여러 개가 동시에 CHECK 를 부를 수 있으므로 원자 변수로 센다 (TSan 빌드에서 레이스 없음) */
+static _Atomic int test_passed = 0;
 
 #define CHECK(expr)                                                        \
     do {                                                                   \

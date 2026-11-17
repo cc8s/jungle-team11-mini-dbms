@@ -1,6 +1,11 @@
 #include "http.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/uio.h>
 
 #define HTTP_VERSION_PREFIX "HTTP/"
 #define HTTP_VERSION_LEN 8 /* "HTTP/1.1" */
@@ -8,6 +13,11 @@
 #define HEADER_TRANSFER_ENCODING "transfer-encoding"
 #define METHOD_POST "POST"
 #define DECIMAL_BASE 10
+#define HEAD_END_MAX_LEN 4      /* "\r\n\r\n" */
+#define RESPONSE_HEAD_MAX 1024  /* 상태 줄 + 고정 헤더 + extra_headers */
+#define RESPONSE_PART_COUNT 2   /* 헤더, 본문 */
+#define MS_PER_SECOND 1000
+#define US_PER_MS 1000
 
 /* 줄 하나: 버퍼 안의 시작과 길이 (끝의 \r\n 또는 \n 은 뺀 것) */
 typedef struct {
@@ -268,4 +278,178 @@ HttpStatus http_parse_request(const char *buf, size_t len, HttpRequest *out_requ
     out_request->body = out_request->content_length > 0 ? buf + head_len : NULL;
     out_request->body_len = out_request->content_length;
     return HTTP_PARSE_OK;
+}
+
+/* ---- 소켓 읽기 ---- */
+
+bool http_set_read_timeout(int fd, int timeout_ms)
+{
+    struct timeval timeout = {
+        .tv_sec = timeout_ms / MS_PER_SECOND,
+        .tv_usec = (timeout_ms % MS_PER_SECOND) * US_PER_MS,
+    };
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0;
+}
+
+/* buf[*len..limit) 에 한 번 더 받는다. 받은 만큼 *len 을 늘린다.
+ * EAGAIN/EWOULDBLOCK 은 SO_RCVTIMEO 가 지난 것 (408), 0 바이트는 상대가 닫은 것 */
+static HttpStatus receive_more(int fd, char *buf, size_t limit, size_t *len)
+{
+    for (;;) {
+        ssize_t n = recv(fd, buf + *len, limit - *len, 0);
+        if (n > 0) {
+            *len += (size_t)n;
+            return HTTP_PARSE_OK;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return HTTP_STATUS_REQUEST_TIMEOUT;
+        return HTTP_READ_CLOSED;
+    }
+}
+
+/* 헤더 끝 빈 줄이 보일 때까지 받는다. 새로 받은 부분과 그 앞 3 바이트만 다시 훑어서
+ * 1 바이트씩 오는 요청도 O(n) 으로 끝난다. 빈 줄 없이 HTTP_MAX_HEAD 를 받으면 431 */
+static HttpStatus receive_head(int fd, char *buf, size_t capacity, size_t *len,
+                               size_t *out_head_len)
+{
+    size_t scanned = 0;
+    for (;;) {
+        size_t start = scanned >= HEAD_END_MAX_LEN ? scanned - (HEAD_END_MAX_LEN - 1) : 0;
+        size_t found = 0;
+        if (http_find_head_end(buf + start, *len - start, &found)) {
+            *out_head_len = start + found;
+            return HTTP_PARSE_OK;
+        }
+        if (*len >= HTTP_MAX_HEAD)
+            return HTTP_STATUS_HEADERS_TOO_LARGE;
+        scanned = *len;
+        HttpStatus status = receive_more(fd, buf, capacity, len);
+        if (status != HTTP_PARSE_OK)
+            return status;
+    }
+}
+
+HttpStatus http_read_request(int fd, char *buf, size_t capacity, HttpRequest *out_request)
+{
+    memset(out_request, 0, sizeof(*out_request));
+    if (capacity < HTTP_MAX_HEAD)
+        return HTTP_STATUS_INTERNAL_ERROR; /* 호출한 쪽 실수: 헤더도 못 담는 버퍼 */
+    size_t len = 0;
+    size_t head_len = 0;
+    HttpStatus status = receive_head(fd, buf, capacity, &len, &head_len);
+    if (status == HTTP_PARSE_OK)
+        status = http_parse_head(buf, head_len, out_request); /* 413 등은 본문을 받기 전에 */
+    if (status != HTTP_PARSE_OK)
+        return status;
+    size_t needed = head_len + out_request->content_length;
+    if (needed > capacity)
+        return HTTP_STATUS_PAYLOAD_TOO_LARGE;
+    while (len < needed && status == HTTP_PARSE_OK) /* 한도를 needed 로 둬서 더 보낸 것은 읽지 않는다 */
+        status = receive_more(fd, buf, needed, &len);
+    if (status != HTTP_PARSE_OK)
+        return status;
+    out_request->body = out_request->content_length > 0 ? buf + head_len : NULL;
+    out_request->body_len = out_request->content_length;
+    return HTTP_PARSE_OK;
+}
+
+/* ---- 소켓 쓰기 ---- */
+
+typedef struct {
+    int status;
+    const char *reason;
+} ReasonPhrase;
+
+/* 상태 코드 → 사유 문구는 이 표 하나에서만 정한다 */
+static const ReasonPhrase REASON_PHRASES[] = {
+    {HTTP_STATUS_OK, "OK"},
+    {HTTP_STATUS_BAD_REQUEST, "Bad Request"},
+    {HTTP_STATUS_NOT_FOUND, "Not Found"},
+    {HTTP_STATUS_METHOD_NOT_ALLOWED, "Method Not Allowed"},
+    {HTTP_STATUS_REQUEST_TIMEOUT, "Request Timeout"},
+    {HTTP_STATUS_LENGTH_REQUIRED, "Length Required"},
+    {HTTP_STATUS_PAYLOAD_TOO_LARGE, "Payload Too Large"},
+    {HTTP_STATUS_URI_TOO_LONG, "URI Too Long"},
+    {HTTP_STATUS_HEADERS_TOO_LARGE, "Request Header Fields Too Large"},
+    {HTTP_STATUS_INTERNAL_ERROR, "Internal Server Error"},
+    {HTTP_STATUS_NOT_IMPLEMENTED, "Not Implemented"},
+    {HTTP_STATUS_SERVICE_UNAVAILABLE, "Service Unavailable"},
+    {HTTP_STATUS_VERSION_NOT_SUPPORTED, "HTTP Version Not Supported"},
+};
+
+const char *http_reason_phrase(int status)
+{
+    for (size_t i = 0; i < sizeof(REASON_PHRASES) / sizeof(REASON_PHRASES[0]); i++) {
+        if (REASON_PHRASES[i].status == status)
+            return REASON_PHRASES[i].reason;
+    }
+    return "Unknown";
+}
+
+/* 앞쪽의 빈 조각을 건너뛴다 (본문 없는 응답, 다 보낸 조각) */
+static int skip_empty_parts(struct iovec **parts, int count)
+{
+    while (count > 0 && (*parts)->iov_len == 0) {
+        (*parts)++;
+        count--;
+    }
+    return count;
+}
+
+/* 조각들을 sendmsg 로 끝까지 보낸다. 일부만 나가면 보낸 만큼 조각을 앞으로 당겨 다시 보낸다.
+ * MSG_NOSIGNAL: 상대가 끊은 소켓에 쓰면 SIGPIPE 로 프로세스가 죽는 대신 EPIPE 로 돌아온다 */
+static bool send_all_parts(int fd, struct iovec *parts, int count)
+{
+    count = skip_empty_parts(&parts, count);
+    while (count > 0) {
+        struct msghdr message = {.msg_iov = parts, .msg_iovlen = (size_t)count};
+        ssize_t n = sendmsg(fd, &message, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return false;
+        size_t sent = (size_t)n;
+        while (count > 0 && sent >= parts->iov_len) {
+            sent -= parts->iov_len;
+            parts++;
+            count--;
+        }
+        if (count > 0) {
+            parts->iov_base = (char *)parts->iov_base + sent;
+            parts->iov_len -= sent;
+        }
+        count = skip_empty_parts(&parts, count);
+    }
+    return true;
+}
+
+bool http_write_all(int fd, const void *buf, size_t len)
+{
+    struct iovec part = {(void *)buf, len};
+    return send_all_parts(fd, &part, 1);
+}
+
+/* 헤더와 본문을 따로 send 하면 작은 패킷 두 개가 Nagle 과 지연 ACK 에 걸려 수십 ms 늦어질 수 있다.
+ * 그래서 두 조각을 한 번의 sendmsg 로 보낸다 */
+bool http_write_response(int fd, const HttpResponse *response)
+{
+    char head[RESPONSE_HEAD_MAX];
+    int head_len = snprintf(head, sizeof(head),
+                            "HTTP/1.1 %d %s\r\n"
+                            "Content-Type: %s\r\n"
+                            "Content-Length: %zu\r\n"
+                            "Connection: close\r\n"
+                            "%s\r\n",
+                            response->status, http_reason_phrase(response->status),
+                            response->content_type, response->body_len,
+                            response->extra_headers == NULL ? "" : response->extra_headers);
+    if (head_len < 0 || (size_t)head_len >= sizeof(head))
+        return false;
+    struct iovec parts[RESPONSE_PART_COUNT] = {
+        {head, (size_t)head_len},
+        {(void *)response->body, response->body == NULL ? 0 : response->body_len},
+    };
+    return send_all_parts(fd, parts, RESPONSE_PART_COUNT);
 }
