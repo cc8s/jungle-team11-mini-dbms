@@ -16,7 +16,7 @@ C 로 직접 만든 **SQL 처리기 + B+ 트리 인덱스 + 스레드 풀 API �
 
 ```bash
 make                              # 빌드
-make test                         # 단위·통합 테스트 (make test-asan: AddressSanitizer)
+make test                         # 단위·통합 테스트 (make test-asan: AddressSanitizer, make test-tsan: ThreadSanitizer)
 make bench                        # 인덱스 대 선형 탐색 벤치마크 (1만·10만·100만 건, 약 1 분)
 mkdir -p data                     # 데이터 디렉터리 (git 제외)
 ./minidb init schema/users.sql    # 스키마로 data/users.tbl 생성

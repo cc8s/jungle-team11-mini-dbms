@@ -16,6 +16,12 @@ TESTS     := $(patsubst tests/%.c, tests/bin/%, $(TEST_SRCS))
 ASAN_LIB_OBJS := $(patsubst src/%.c, $(ASAN_DIR)/%.o, $(LIB_SRCS))
 ASAN_TESTS    := $(patsubst tests/%.c, $(ASAN_DIR)/tests/%, $(TEST_SRCS))
 
+# TSan 빌드 (데이터 레이스 검사). ASan 과 같이 쓸 수 없어서 디렉터리를 따로 쓴다
+TSAN_FLAGS    := -fsanitize=thread -fno-omit-frame-pointer
+TSAN_DIR      := build/tsan
+TSAN_LIB_OBJS := $(patsubst src/%.c, $(TSAN_DIR)/%.o, $(LIB_SRCS))
+TSAN_TESTS    := $(patsubst tests/%.c, $(TSAN_DIR)/tests/%, $(TEST_SRCS))
+
 # 작은 차수로 test_btree 를 한 번 더 빌드한다. split 이 자주 일어나 경계 경로를 많이 밟는다.
 # 차수가 바뀌면 노드 크기가 바뀌므로 트리 소스만 따로 컴파일하고, 메모리 오류를 잡도록 ASan 을 켠다.
 SMALL_ORDERS := 3 4
@@ -29,10 +35,10 @@ SLOW_TESTS_ENV := MINIDB_SLOW_TESTS=1
 BENCH       := build/bench/bench_index
 BENCH_SIZES ?=
 
-.PHONY: all test test-asan test-order test-slow bench run clean
+.PHONY: all test test-asan test-tsan test-order test-slow bench run clean
 
 # 테스트 링크에만 쓰이는 오브젝트를 make 가 중간 파일로 보고 지우지 않게 한다 (매번 다시 빌드 방지)
-.SECONDARY: $(LIB_OBJS) $(ASAN_LIB_OBJS)
+.SECONDARY: $(LIB_OBJS) $(ASAN_LIB_OBJS) $(TSAN_LIB_OBJS)
 
 all: $(BIN)
 
@@ -42,7 +48,7 @@ $(BIN): build/main.o $(LIB_OBJS)
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -MMD -c $< -o $@
 
-build tests/bin $(ASAN_DIR) $(ASAN_DIR)/tests:
+build tests/bin $(ASAN_DIR) $(ASAN_DIR)/tests $(TSAN_DIR) $(TSAN_DIR)/tests:
 	mkdir -p $@
 
 tests/bin/%: tests/%.c $(LIB_OBJS) | tests/bin
@@ -55,6 +61,13 @@ $(ASAN_DIR)/tests/%: tests/%.c $(ASAN_LIB_OBJS) | $(ASAN_DIR)/tests
 	$(CC) $(CFLAGS) $(ASAN_FLAGS) -Itests -MMD $(filter %.c %.o, $^) -o $@ \
 		$(LDFLAGS) $(ASAN_FLAGS)
 
+$(TSAN_DIR)/%.o: src/%.c | $(TSAN_DIR)
+	$(CC) $(CFLAGS) $(TSAN_FLAGS) -MMD -c $< -o $@
+
+$(TSAN_DIR)/tests/%: tests/%.c $(TSAN_LIB_OBJS) | $(TSAN_DIR)/tests
+	$(CC) $(CFLAGS) $(TSAN_FLAGS) -Itests -MMD $(filter %.c %.o, $^) -o $@ \
+		$(LDFLAGS) $(TSAN_FLAGS)
+
 build/order%/test_btree: $(BTREE_DEPS)
 	mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(ASAN_FLAGS) -DBTREE_ORDER=$* -Itests tests/test_btree.c src/btree.c -o $@ \
@@ -66,6 +79,10 @@ test: $(TESTS) test-order
 
 test-asan: $(ASAN_TESTS) test-order
 	@for t in $(ASAN_TESTS); do echo "== $$t"; ./$$t || exit 1; done
+
+# 전체 테스트를 ThreadSanitizer 로 다시 돌린다. 레이스가 보고되면 실패 (halt_on_error)
+test-tsan: $(TSAN_TESTS)
+	@for t in $(TSAN_TESTS); do echo "== $$t"; TSAN_OPTIONS=halt_on_error=1 ./$$t || exit 1; done
 
 test-order: $(ORDER_TESTS)
 	@for t in $(ORDER_TESTS); do echo "== $$t"; ./$$t || exit 1; done
@@ -88,4 +105,5 @@ run: $(BIN)
 clean:
 	rm -rf build tests/bin $(BIN)
 
--include $(wildcard build/*.d $(ASAN_DIR)/*.d tests/bin/*.d $(ASAN_DIR)/tests/*.d build/bench/*.d)
+-include $(wildcard build/*.d $(ASAN_DIR)/*.d tests/bin/*.d $(ASAN_DIR)/tests/*.d $(TSAN_DIR)/*.d $(TSAN_DIR)/tests/*.d \
+	build/bench/*.d)
