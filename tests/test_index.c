@@ -7,7 +7,9 @@
 #include <unistd.h>
 
 #include "btree.h"
+#include "btree_internal.h"
 #include "cli.h"
+#include "table_internal.h"
 
 /* users 레코드: id 4 + name 32 + age 4 */
 #define USERS_SQL "CREATE TABLE users (id INT, name VARCHAR(32), age INT);"
@@ -352,6 +354,143 @@ static void test_cli_prints_recovery_warning(void)
     test_db_destroy(&db);
 }
 
+/* ---- S26 INSERT 연동 ---- */
+
+#define ORDERS_SQL "CREATE TABLE orders (id INT, item VARCHAR(4));"
+#define ORDERS_RECORD_SIZE 8 /* id 4 + item 4 */
+#define INSERT_ORDER "INSERT INTO orders VALUES ('pen')"
+#define INSERT_TOO_LONG "INSERT INTO users VALUES ('this name is far longer than 32 bytes', 1)"
+#define THOUSAND_ROWS 1000
+#define ALTERNATE_ROUNDS 50
+
+static const Table *find_users(const Engine *engine)
+{
+    const Table *table = engine_find_table(engine, "users");
+    CHECK(table != NULL);
+    return table;
+}
+
+/* T26-01 */
+static void test_insert_is_indexed_immediately(void)
+{
+    TestDb db = open_db();
+    int32_t id = insert_user(db.engine);
+    uint64_t offset = 0;
+    CHECK(btree_search(table_index(find_users(db.engine)), id, &offset));
+    CHECK(offset == expected_offset(id));
+    test_db_destroy(&db);
+}
+
+/* T26-02 */
+static void test_insert_thousand_rows(void)
+{
+    TestDb db = open_db();
+    for (int i = 0; i < THOUSAND_ROWS; i++)
+        insert_user(db.engine);
+    check_index(find_users(db.engine), THOUSAND_ROWS);
+    test_db_destroy(&db);
+}
+
+/* T26-03 */
+static void test_inserted_index_matches_rebuilt(void)
+{
+    TestDb db = open_db();
+    for (int i = 0; i < MEDIUM_ROW_COUNT; i++)
+        insert_user(db.engine);
+    check_index(find_users(db.engine), MEDIUM_ROW_COUNT); /* INSERT 로 쌓은 인덱스 */
+    test_db_reopen(&db);
+    CHECK(db.engine != NULL);
+    check_index(find_users(db.engine), MEDIUM_ROW_COUNT); /* 파일에서 재구축한 인덱스 */
+    CHECK(engine_warning_count(db.engine) == 0);
+    test_db_destroy(&db);
+}
+
+/* E26-01 */
+static void test_failed_validation_keeps_index(void)
+{
+    TestDb db = open_db();
+    insert_user(db.engine);
+    Result result = engine_execute(db.engine, INSERT_TOO_LONG, NULL, 0);
+    CHECK(result.error == ERR_VALUE_TOO_LONG);
+    result_free(&result);
+    check_index(find_users(db.engine), 1);
+    test_db_destroy(&db);
+}
+
+/* 레코드 하나를 table 에 직접 append 한다 (users: name, age) */
+static ErrorCode append_user(Table *table, int32_t *out_id)
+{
+    uint8_t record[USERS_RECORD_SIZE];
+    Value values[] = {value_from_string("kim", strlen("kim")), value_from_int(25)};
+    CHECK(table_encode_record(table, table_next_id(table), values, 2, record) == ERR_NONE);
+    value_free(&values[0]); /* 문자열 값은 복사본을 가진다 */
+    return table_append_record(table, record, out_id);
+}
+
+/* E26-02 */
+static void test_write_failure_keeps_index(void)
+{
+    TestDb db = create_users_file(SMALL_ROW_COUNT);
+    Table *table = open_users(&db);
+    char path[TEST_PATH_MAX];
+    users_path(&db, path);
+
+    /* 쓰기 실패 주입: 테이블의 fd 를 같은 파일의 읽기 전용 fd 로 바꿔 pwrite 가 실패하게 한다 */
+    int writable_fd = table->fd;
+    table->fd = open(path, O_RDONLY);
+    CHECK(table->fd >= 0);
+    int32_t id = 0;
+    CHECK(append_user(table, &id) == ERR_IO);
+    check_index(table, SMALL_ROW_COUNT);
+    check_counters(table, SMALL_ROW_COUNT, SMALL_ROW_COUNT + 1);
+
+    close(table->fd);
+    table->fd = writable_fd;
+    table_close(table);
+    test_db_destroy(&db);
+}
+
+/* S26 구현 항목: 트리 삽입이 메모리 부족으로 실패해도 레코드는 파일에 있고, 다음 열기 재구축에서 들어온다 */
+static void test_tree_failure_recovered_by_rebuild(void)
+{
+    TestDb db = create_users_file(BTREE_MAX_KEYS); /* 루트 리프가 꽉 참: 다음 삽입은 노드 할당 필요 */
+    Table *table = open_users(&db);
+    table->index->alloc_budget = 0;
+    int32_t id = 0;
+    CHECK(append_user(table, &id) == ERR_INTERNAL);
+    CHECK(table_record_count(table) == BTREE_MAX_KEYS + 1); /* 파일과 헤더는 이미 갱신됨 */
+    CHECK(btree_size(table_index(table)) == BTREE_MAX_KEYS);
+    table_close(table);
+
+    table = open_users(&db);
+    check_index(table, BTREE_MAX_KEYS + 1);
+    check_no_recovery(table); /* 헤더는 맞게 쓰였으므로 복구할 것도 없다 */
+    table_close(table);
+    test_db_destroy(&db);
+}
+
+/* E26-03 */
+static void test_two_tables_keep_own_index(void)
+{
+    TestDb db = test_db_create(USERS_SQL ORDERS_SQL);
+    CHECK(db.engine != NULL);
+    for (int i = 0; i < ALTERNATE_ROUNDS; i++) {
+        insert_user(db.engine);
+        Result result = engine_execute(db.engine, INSERT_ORDER, NULL, 0);
+        CHECK(result.error == ERR_NONE);
+        result_free(&result);
+    }
+    check_index(find_users(db.engine), ALTERNATE_ROUNDS);
+    const BTree *orders = table_index(engine_find_table(db.engine, "orders"));
+    CHECK(btree_size(orders) == ALTERNATE_ROUNDS);
+    for (int32_t id = 1; id <= ALTERNATE_ROUNDS; id++) {
+        uint64_t offset = 0;
+        CHECK(btree_search(orders, id, &offset));
+        CHECK(offset == HEADER_SIZE + (uint64_t)(id - 1) * ORDERS_RECORD_SIZE);
+    }
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     printf("test_index\n");
@@ -367,6 +506,13 @@ int main(void)
     RUN(test_insert_after_recovery_continues_ids);
     RUN(test_reopen_after_recovery_is_clean);
     RUN(test_cli_prints_recovery_warning);
+    RUN(test_insert_is_indexed_immediately);
+    RUN(test_insert_thousand_rows);
+    RUN(test_inserted_index_matches_rebuilt);
+    RUN(test_failed_validation_keeps_index);
+    RUN(test_write_failure_keeps_index);
+    RUN(test_tree_failure_recovered_by_rebuild);
+    RUN(test_two_tables_keep_own_index);
     TEST_DONE();
     return 0;
 }

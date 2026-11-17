@@ -8,6 +8,7 @@
 #include "error.h"
 #include "result.h"
 #include "statement.h"
+#include "table.h"
 
 typedef struct Engine Engine;
 
@@ -22,6 +23,9 @@ void engine_close(Engine *engine);
  * CLI·서버가 꺼내서 stderr 등에 낸다. 문자열은 engine_close 까지 유효하다. */
 int engine_warning_count(const Engine *engine);
 const char *engine_warning(const Engine *engine, int index);
+
+/* 이름이 name 인 테이블 (인덱스·재구축 시간 조회, 테스트·벤치마크용). 없으면 NULL */
+const Table *engine_find_table(const Engine *engine, const char *name);
 
 /* sql 한 문장을 실행한다 (단일 문장 모드: 두 번째 문장은 ERR_UNSUPPORTED, 빈 입력은 ERR_SYNTAX).
  * 결과는 호출한 쪽이 result_free 한다. params 는 Phase 3 바인딩용 (지금은 param_count = 0 만). */

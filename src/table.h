@@ -106,9 +106,11 @@ int32_t table_record_size(const Table *table);
 ErrorCode table_encode_record(const Table *table, int32_t id, const Value *values,
                               int value_count, uint8_t *out_record);
 
-/* record 를 다음 id 자리에 쓰고 헤더의 next_id, row_count 를 갱신한다.
+/* record 를 다음 id 자리에 쓰고 헤더의 next_id, row_count 를 갱신한 뒤 id 인덱스에 등록한다.
  * record 의 id 칸은 table_next_id 여야 한다 (아니면 ERR_INTERNAL).
- * next_id 가 INT32_MAX 를 넘게 되면 ERR_OUT_OF_RANGE (파일 변경 없음), 쓰기 실패는 ERR_IO. */
+ * next_id 가 INT32_MAX 를 넘게 되면 ERR_OUT_OF_RANGE (파일 변경 없음), 쓰기 실패는 ERR_IO (인덱스 변경 없음).
+ * 인덱스 등록이 메모리 부족으로 실패하면 ERR_INTERNAL: 레코드는 이미 파일에 있고 *out_id 도 채워지며,
+ * 다음 table_open 의 재구축에서 인덱스에 들어간다. */
 ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_id);
 
 /* id 번 레코드를 out_record (table_record_size 바이트) 에 읽는다. 없는 id 는 ERR_INTERNAL */

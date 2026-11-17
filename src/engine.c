@@ -170,6 +170,11 @@ const char *engine_warning(const Engine *engine, int index)
     return engine->warnings[index];
 }
 
+const Table *engine_find_table(const Engine *engine, const char *name)
+{
+    return validator_find_table(engine->tables, engine->table_count, name);
+}
+
 /* ---- 실행 ---- */
 
 static double elapsed_ms_since(const struct timespec *start)

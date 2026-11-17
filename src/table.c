@@ -426,8 +426,12 @@ static bool write_counters(Table *table, int32_t next_id, int32_t row_count)
     return write_all_at(table->fd, bytes, sizeof(bytes), NEXT_ID_OFFSET);
 }
 
-/* 순서: 레코드 → 헤더. 중간에 죽으면 파일 끝에 row_count 밖의 레코드가 남을 뿐이고
- * 열 때 그 부분은 무시된다 (S11, Phase 2 에서 복구). 메모리의 헤더는 두 쓰기가 다 끝난 뒤에만 바꾼다 */
+/* 순서: 레코드 → 헤더 → 인덱스.
+ * - 레코드를 쓰고 헤더 전에 죽으면 파일 끝에 row_count 밖의 레코드가 남고, 다음 열기에서 채택된다 (S25).
+ * - 파일 쓰기가 실패하면 인덱스에 등록하지 않는다: 인덱스에는 파일에 확정된 레코드만 있어야 한다.
+ * - 메모리의 헤더는 두 쓰기가 다 끝난 뒤에만 바꾼다.
+ * - 트리 삽입이 실패하면 (메모리 부족) ERR_INTERNAL. 레코드와 헤더는 이미 파일에 있으므로
+ *   되돌리지 않는다: 다음 table_open 의 재구축이 파일을 기준으로 인덱스를 다시 만든다. */
 ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_id)
 {
     int32_t id = table->header.next_id;
@@ -443,6 +447,8 @@ ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_
     table->header.next_id = id + 1;
     table->header.row_count++;
     *out_id = id;
+    if (btree_insert(table->index, id, (uint64_t)record_offset(table, id)) != BTREE_OK)
+        return ERR_INTERNAL;
     return ERR_NONE;
 }
 
