@@ -321,6 +321,128 @@ static void test_nul_byte_in_sql_file(void)
     workspace_remove(&ws);
 }
 
+/* ---- S28 대량 데이터 도구 ---- */
+
+/* 이름이 user100000 (10 자) 까지 들어가도록 VARCHAR(32) */
+#define BULK_SCHEMA "CREATE TABLE users (id INT, name VARCHAR(32), age INT);\n"
+#define GEN_SQL_COMMAND "python3 tools/gen_sql.py"
+#define COMMAND_SIZE (TEST_PATH_MAX + 64)
+#define GEN_SMALL_COUNT 10
+#define GEN_BULK_COUNT 100000
+#define LINE_SIZE 128
+
+/* tools/gen_sql.py count 의 출력을 ws->dir/name 에 쓰고 경로를 남긴다. 테스트는 저장소 루트에서 돈다 */
+static void generate_sql(const Workspace *ws, int count, const char *name, char *out_path)
+{
+    snprintf(out_path, TEST_PATH_MAX, "%s/%s", ws->dir, name);
+    char command[COMMAND_SIZE];
+    snprintf(command, sizeof(command), GEN_SQL_COMMAND " %d > '%s'", count, out_path);
+    CHECK(system(command) == 0);
+}
+
+static CliRun run_sql_file(Workspace *ws, char *path)
+{
+    char *argv[] = { "minidb", "-d", ws->data_dir, "-q", path, NULL };
+    return run_cli(5, argv);
+}
+
+static int32_t users_row_count(const Workspace *ws)
+{
+    char path[COMMAND_SIZE]; /* data_dir (최대 TEST_PATH_MAX) + "/users.tbl" */
+    snprintf(path, sizeof(path), "%s/users.tbl", ws->data_dir);
+    ErrorCode error = ERR_NONE;
+    Table *table = table_open(path, &error);
+    CHECK(table != NULL);
+    int32_t count = table_record_count(table);
+    table_close(table);
+    return count;
+}
+
+/* T28-01 */ static void test_gen_sql_lines(void)
+{
+    Workspace ws = workspace_make();
+    char path[TEST_PATH_MAX];
+    generate_sql(&ws, GEN_SMALL_COUNT, "small.sql", path);
+    FILE *file = fopen(path, "r"); /* 테스트 확인용 (엔진 I/O 규칙 대상 아님) */
+    CHECK(file != NULL);
+    char line[LINE_SIZE];
+    int count = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        count++;
+        char expected[LINE_SIZE];
+        snprintf(expected, sizeof(expected), "INSERT INTO users VALUES ('user%d', ", count);
+        CHECK(strncmp(line, expected, strlen(expected)) == 0);
+        CHECK(strstr(line, ");\n") != NULL);
+    }
+    fclose(file);
+    CHECK(count == GEN_SMALL_COUNT);
+    workspace_remove(&ws);
+}
+
+/* T28-02, E28-03 (ASan 빌드에서 문장마다 누수 없음) */ static void test_run_generated_bulk(void)
+{
+    Workspace ws = workspace_make();
+    CliRun init = run_init(&ws, BULK_SCHEMA);
+    CHECK(init.code == EXIT_OK);
+    cli_run_free(&init);
+    char path[TEST_PATH_MAX];
+    generate_sql(&ws, GEN_BULK_COUNT, "bulk.sql", path);
+    CliRun run = run_sql_file(&ws, path);
+    CHECK(run.code == EXIT_OK);
+    CHECK(strstr(run.out, "100000 statements, 0 errors") != NULL);
+    CHECK(run.err[0] == '\0');
+    cli_run_free(&run);
+    CHECK(users_row_count(&ws) == GEN_BULK_COUNT);
+    workspace_remove(&ws);
+}
+
+/* T28-03 */ static void test_quiet_prints_only_summary(void)
+{
+    Workspace ws = workspace_make();
+    CliRun init = run_init(&ws, BULK_SCHEMA);
+    cli_run_free(&init);
+    char path[TEST_PATH_MAX];
+    generate_sql(&ws, GEN_SMALL_COUNT, "small.sql", path);
+    CliRun run = run_sql_file(&ws, path);
+    CHECK(run.code == EXIT_OK);
+    CHECK_STR_EQ(run.out, "10 statements, 0 errors\n");
+    CHECK(run.err[0] == '\0');
+    cli_run_free(&run);
+    workspace_remove(&ws);
+}
+
+/* E28-01 */ static void test_gen_sql_zero(void)
+{
+    Workspace ws = workspace_make();
+    char path[TEST_PATH_MAX];
+    generate_sql(&ws, 0, "empty.sql", path);
+    struct stat info;
+    CHECK(stat(path, &info) == 0);
+    CHECK(info.st_size == 0);
+    workspace_remove(&ws);
+}
+
+/* E28-02 */ static void test_run_generated_twice(void)
+{
+    Workspace ws = workspace_make();
+    CliRun init = run_init(&ws, BULK_SCHEMA);
+    cli_run_free(&init);
+    char path[TEST_PATH_MAX];
+    generate_sql(&ws, GEN_SMALL_COUNT, "small.sql", path);
+    for (int i = 0; i < 2; i++) {
+        CliRun run = run_sql_file(&ws, path);
+        CHECK(run.code == EXIT_OK);
+        cli_run_free(&run);
+    }
+    CHECK(users_row_count(&ws) == 2 * GEN_SMALL_COUNT); /* id 1..2N */
+    CliRun select = run_sql(&ws, "SELECT id FROM users WHERE name = 'user1';", false);
+    CHECK(select.code == EXIT_OK);
+    CHECK(strstr(select.out, "2 rows") != NULL); /* 이름은 중복될 수 있다 */
+    CHECK(strstr(select.out, "| 11 ") != NULL);
+    cli_run_free(&select);
+    workspace_remove(&ws);
+}
+
 int main(void)
 {
     RUN(test_init_then_run);
@@ -336,6 +458,11 @@ int main(void)
     RUN(test_unknown_option);
     RUN(test_directory_as_sql_file);
     RUN(test_nul_byte_in_sql_file);
+    RUN(test_gen_sql_lines);
+    RUN(test_run_generated_bulk);
+    RUN(test_quiet_prints_only_summary);
+    RUN(test_gen_sql_zero);
+    RUN(test_run_generated_twice);
     TEST_DONE();
     return 0;
 }

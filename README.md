@@ -21,6 +21,8 @@ mkdir -p data                     # 데이터 디렉터리 (git 제외)
 ./minidb init schema/users.sql    # 스키마로 data/users.tbl 생성
 ./minidb query.sql                # SQL 파일 실행
 ./minidb -d other_dir -q query.sql  # 다른 데이터 디렉터리, 에러와 요약만 출력
+python3 tools/gen_sql.py 1000000 > data/bulk.sql   # 대량 INSERT SQL (이름 user1..N, 나이 시드 고정)
+./minidb -q data/bulk.sql         # 100 만 건 삽입 (측정 결과: docs/benchmark.md)
 ```
 
 종료 코드: 모든 문장 성공 `0`, SQL 에러가 하나라도 있음 `1`, 사용법·파일·디렉터리 오류 `2`.
