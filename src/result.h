@@ -11,8 +11,6 @@
 #include "common.h"
 #include "error.h"
 
-#define MAX_MESSAGE 256 /* 에러 메시지 버퍼 크기 (\0 포함), 넘으면 잘린다 */
-
 typedef struct {
     char name[MAX_NAME];
     ColumnType type;

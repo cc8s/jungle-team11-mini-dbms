@@ -8,6 +8,7 @@
 #define MAX_SQL_LEN 65536 /* 문장 하나의 최대 바이트 수, 넘으면 ERR_TOO_LARGE */
 #define HEADER_SIZE 1024  /* .tbl 헤더 고정 크기, 레코드는 이 뒤부터 */
 #define MAX_VARCHAR 1024  /* VARCHAR(n) 의 n 상한 */
+#define MAX_MESSAGE 256   /* 에러 메시지 버퍼 크기 (\0 포함), 넘으면 잘린다 */
 
 typedef enum {
     COL_INT,     /* int32_t, 리틀 엔디언 4 바이트 */
