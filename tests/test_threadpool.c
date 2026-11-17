@@ -1,6 +1,8 @@
 #include "test.h"
 
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "threadpool.h"
@@ -175,6 +177,239 @@ static void test_submit_after_shutdown_flag(void)
     threadpool_shutdown(pool);
 }
 
+/* ---- S31 워커와 종료 ---- */
+
+#define JOB_COUNT 1000
+#define WORKER_COUNT 4
+#define SMALL_QUEUE 16
+#define RENDEZVOUS_JOBS 2 /* 처음 두 작업은 서로를 기다린다: 서로 다른 두 워커가 있어야 끝난다 */
+
+/* 테스트가 열어 줄 때까지 handler 를 붙잡아 두는 문. 시간 (sleep) 에 기대지 않고 순서를 만든다 */
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    bool is_open;
+    int waiting; /* 문 앞에서 기다리는 handler 수 */
+} Gate;
+
+static void gate_init(Gate *gate)
+{
+    CHECK(pthread_mutex_init(&gate->mutex, NULL) == 0);
+    CHECK(pthread_cond_init(&gate->changed, NULL) == 0);
+    gate->is_open = false;
+    gate->waiting = 0;
+}
+
+static void gate_destroy(Gate *gate)
+{
+    pthread_cond_destroy(&gate->changed);
+    pthread_mutex_destroy(&gate->mutex);
+}
+
+static void gate_pass(Gate *gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    gate->waiting++;
+    pthread_cond_broadcast(&gate->changed);
+    while (!gate->is_open)
+        pthread_cond_wait(&gate->changed, &gate->mutex);
+    gate->waiting--;
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+/* handler count 개가 문 앞에 도착할 때까지 기다린다 (= 워커가 작업을 꺼내 갔다) */
+static void gate_wait_for(Gate *gate, int count)
+{
+    pthread_mutex_lock(&gate->mutex);
+    while (gate->waiting < count)
+        pthread_cond_wait(&gate->changed, &gate->mutex);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void gate_open(Gate *gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    gate->is_open = true;
+    pthread_cond_broadcast(&gate->changed);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+/* handler 가 공유하는 상태. 워커 여러 개가 동시에 쓰는 칸은 모두 원자 변수 */
+typedef struct {
+    atomic_int handled;
+    atomic_int seen[JOB_COUNT];       /* connfd 별 처리 횟수 */
+    pthread_t threads[JOB_COUNT];     /* connfd 를 처리한 스레드 (칸마다 한 워커만 쓴다) */
+    int order[JOB_COUNT];             /* 워커 1 개 테스트에서만 쓴다 */
+    Gate *gate;                       /* NULL 이면 막지 않는다 */
+    pthread_barrier_t *rendezvous;    /* NULL 이면 쓰지 않는다 */
+} Work;
+
+static void record_job(int connfd, void *ctx)
+{
+    Work *work = ctx;
+    if (work->rendezvous != NULL && connfd < RENDEZVOUS_JOBS)
+        pthread_barrier_wait(work->rendezvous);
+    if (work->gate != NULL)
+        gate_pass(work->gate);
+    int index = atomic_fetch_add(&work->handled, 1);
+    work->order[index % JOB_COUNT] = connfd;
+    work->threads[connfd] = pthread_self();
+    atomic_fetch_add(&work->seen[connfd], 1);
+}
+
+static Work *create_work(void)
+{
+    Work *work = calloc(1, sizeof(*work));
+    CHECK(work != NULL);
+    return work;
+}
+
+static ThreadPool *create_pool(int workers, int capacity, Work *work)
+{
+    ThreadPool *pool = threadpool_create(workers, capacity, record_job, work);
+    CHECK(pool != NULL);
+    return pool;
+}
+
+/* 큐가 차 있으면 워커가 비울 때까지 다시 넣는다 */
+static void submit_all(ThreadPool *pool, int count)
+{
+    for (int connfd = 0; connfd < count; connfd++) {
+        while (!threadpool_submit(pool, connfd))
+            sched_yield();
+    }
+}
+
+/* T31-01, T31-03 (ASan 빌드에서 누수 없음) */
+static void test_workers_handle_every_job_once(void)
+{
+    Work *work = create_work();
+    ThreadPool *pool = create_pool(WORKER_COUNT, SMALL_QUEUE, work);
+    submit_all(pool, JOB_COUNT);
+    threadpool_shutdown(pool); /* 남은 작업을 다 처리하고 join 한 뒤 돌아온다 */
+    CHECK(atomic_load(&work->handled) == JOB_COUNT);
+    for (int i = 0; i < JOB_COUNT; i++)
+        CHECK(atomic_load(&work->seen[i]) == 1);
+    free(work);
+}
+
+/* T31-02 */
+static void test_jobs_spread_over_workers(void)
+{
+    Work *work = create_work();
+    pthread_barrier_t rendezvous;
+    CHECK(pthread_barrier_init(&rendezvous, NULL, RENDEZVOUS_JOBS) == 0);
+    work->rendezvous = &rendezvous;
+    ThreadPool *pool = create_pool(WORKER_COUNT, SMALL_QUEUE, work);
+    submit_all(pool, JOB_COUNT);
+    threadpool_shutdown(pool);
+    pthread_barrier_destroy(&rendezvous);
+    /* 작업 0 과 1 은 barrier 에서 서로를 기다렸으므로 동시에 handler 안에 있었다 = 다른 워커 */
+    CHECK(!pthread_equal(work->threads[0], work->threads[1]));
+    CHECK(atomic_load(&work->handled) == JOB_COUNT);
+    free(work);
+}
+
+typedef struct {
+    ThreadPool *pool;
+} ShutdownCall;
+
+static void *call_shutdown(void *arg)
+{
+    threadpool_shutdown(((ShutdownCall *)arg)->pool);
+    return NULL;
+}
+
+static bool is_shutting_down(ThreadPool *pool)
+{
+    pthread_mutex_lock(&pool->mutex);
+    bool flag = pool->is_shutting_down;
+    pthread_mutex_unlock(&pool->mutex);
+    return flag;
+}
+
+/* E31-01, E31-02 */
+static void test_shutdown_drains_queue(void)
+{
+    Gate gate;
+    gate_init(&gate);
+    Work *work = create_work();
+    work->gate = &gate;
+    ThreadPool *pool = create_pool(WORKER_COUNT, SMALL_QUEUE, work);
+    submit_all(pool, WORKER_COUNT);
+    gate_wait_for(&gate, WORKER_COUNT); /* 워커가 모두 handler 안에 붙잡혔다 */
+    for (int connfd = WORKER_COUNT; connfd < WORKER_COUNT + SMALL_QUEUE; connfd++)
+        CHECK(threadpool_submit(pool, connfd)); /* 큐를 가득 채운다 */
+
+    pthread_t closer;
+    ShutdownCall call = {pool};
+    CHECK(pthread_create(&closer, NULL, call_shutdown, &call) == 0);
+    while (!is_shutting_down(pool))
+        sched_yield();
+    CHECK(!threadpool_submit(pool, JOB_COUNT - 1)); /* E31-02: 종료 중에는 받지 않는다 */
+    gate_open(&gate);
+    CHECK(pthread_join(closer, NULL) == 0);
+
+    CHECK(atomic_load(&work->handled) == WORKER_COUNT + SMALL_QUEUE); /* 큐에 남은 것까지 */
+    CHECK(atomic_load(&work->seen[JOB_COUNT - 1]) == 0);
+    gate_destroy(&gate);
+    free(work);
+}
+
+/* E31-03 */
+static void test_shutdown_without_jobs(void)
+{
+    Work *work = create_work();
+    ThreadPool *pool = create_pool(WORKER_COUNT, SMALL_QUEUE, work);
+    threadpool_shutdown(pool); /* 기다리던 워커가 broadcast 로 깨어나 나간다 (멈추면 테스트가 끝나지 않음) */
+    CHECK(atomic_load(&work->handled) == 0);
+    free(work);
+}
+
+/* E31-04 */
+static void test_single_worker_keeps_order(void)
+{
+    Work *work = create_work();
+    ThreadPool *pool = create_pool(1, SMALL_QUEUE, work);
+    submit_all(pool, JOB_COUNT);
+    threadpool_shutdown(pool);
+    CHECK(atomic_load(&work->handled) == JOB_COUNT);
+    for (int i = 0; i < JOB_COUNT; i++)
+        CHECK(work->order[i] == i); /* 워커가 하나면 FIFO 순서 그대로 */
+    free(work);
+}
+
+/* E31-05 */
+static void test_invalid_worker_count(void)
+{
+    Work *work = create_work();
+    CHECK(threadpool_create(0, SMALL_QUEUE, record_job, work) == NULL);
+    CHECK(threadpool_create(-1, SMALL_QUEUE, record_job, work) == NULL);
+    CHECK(threadpool_create(WORKER_COUNT, 0, record_job, work) == NULL);
+    CHECK(threadpool_create(WORKER_COUNT, SMALL_QUEUE, NULL, work) == NULL);
+    free(work);
+}
+
+/* E31-06 */
+static void test_busy_workers_cause_backpressure(void)
+{
+    Gate gate;
+    gate_init(&gate);
+    Work *work = create_work();
+    work->gate = &gate;
+    ThreadPool *pool = create_pool(1, 2, work);
+    CHECK(threadpool_submit(pool, 0));
+    gate_wait_for(&gate, 1); /* 워커가 작업 0 을 붙잡고 있다 (느린 handler) */
+    CHECK(threadpool_submit(pool, 1));
+    CHECK(threadpool_submit(pool, 2));
+    CHECK(!threadpool_submit(pool, 3)); /* 큐 2 칸이 다 찼다: 기다리지 않고 false */
+    gate_open(&gate);
+    threadpool_shutdown(pool);
+    CHECK(atomic_load(&work->handled) == 3);
+    gate_destroy(&gate);
+    free(work);
+}
+
 int main(void)
 {
     printf("test_threadpool\n");
@@ -186,6 +421,13 @@ int main(void)
     RUN(test_invalid_capacity);
     RUN(test_concurrent_submit);
     RUN(test_submit_after_shutdown_flag);
+    RUN(test_workers_handle_every_job_once);
+    RUN(test_jobs_spread_over_workers);
+    RUN(test_shutdown_drains_queue);
+    RUN(test_shutdown_without_jobs);
+    RUN(test_single_worker_keeps_order);
+    RUN(test_invalid_worker_count);
+    RUN(test_busy_workers_cause_backpressure);
     TEST_DONE();
     return 0;
 }
