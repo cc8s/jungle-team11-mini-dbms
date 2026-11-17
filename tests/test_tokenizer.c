@@ -253,6 +253,266 @@ static void test_tokenizer_advances_after_error(void)
     CHECK(next_ok(&tokenizer).type == TOK_SEMI);
 }
 
+/* ---- S04: 리터럴, 주석, 제한 ---- */
+
+static Token single_token(const char *sql, size_t len)
+{
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, len);
+    Token token = next_ok(&tokenizer);
+    CHECK(next_ok(&tokenizer).type == TOK_EOF);
+    return token;
+}
+
+static int32_t single_int(const char *sql)
+{
+    Token token = single_token(sql, strlen(sql));
+    CHECK(token.type == TOK_INT);
+    return token.int_value;
+}
+
+/* 문자열 토큰 하나를 읽어 이스케이프를 푼 값이 expected 와 같은지 본다 */
+static void check_single_string(const char *sql, const char *expected, size_t expected_len)
+{
+    Token token = single_token(sql, strlen(sql));
+    CHECK(token.type == TOK_STRING);
+    CHECK(token.string_len == expected_len);
+
+    char *text = malloc(token.string_len + 1);
+    CHECK(text != NULL);
+    tokenizer_copy_string(&token, text);
+    CHECK(memcmp(text, expected, expected_len) == 0);
+    CHECK(text[expected_len] == '\0');
+    free(text);
+}
+
+/* T04-01 */ static void test_integer(void)
+{
+    CHECK(single_int("42") == 42);
+}
+
+/* T04-02 */ static void test_negative_integer(void)
+{
+    CHECK(single_int("-7") == -7);
+}
+
+/* T04-03 */ static void test_string(void)
+{
+    check_single_string("'kim'", "kim", 3);
+}
+
+/* T04-04 */ static void test_string_quote_escape(void)
+{
+    check_single_string("'it''s'", "it's", 4);
+}
+
+/* T04-05 */ static void test_string_with_spaces(void)
+{
+    check_single_string("'kim lee, park'", "kim lee, park", 13);
+}
+
+/* T04-06 */ static void test_korean_string(void)
+{
+    check_single_string("'김철수'", "김철수", 9);
+}
+
+/* T04-07 */ static void test_line_comment(void)
+{
+    const char *sql = "SELECT -- 주석\n*";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    CHECK(next_ok(&tokenizer).keyword == KW_SELECT);
+    Token star = next_ok(&tokenizer);
+    CHECK(star.type == TOK_STAR);
+    CHECK(star.line == 2);
+    CHECK(next_ok(&tokenizer).type == TOK_EOF);
+}
+
+/* T04-08 */ static void test_placeholders_are_numbered(void)
+{
+    const char *sql = "? ?";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    for (int i = 0; i < 2; i++) {
+        Token token = next_ok(&tokenizer);
+        CHECK(token.type == TOK_PARAM);
+        CHECK(token.param_index == i);
+    }
+}
+
+/* E04-01 */ static void test_int_max(void)
+{
+    CHECK(single_int("2147483647") == INT32_MAX);
+}
+
+/* E04-02 */ static void test_int_max_plus_one(void)
+{
+    CHECK(first_error("2147483648") == ERR_OUT_OF_RANGE);
+}
+
+/* E04-03 */ static void test_int_min(void)
+{
+    CHECK(single_int("-2147483648") == INT32_MIN);
+}
+
+/* E04-04 */ static void test_int_min_minus_one(void)
+{
+    CHECK(first_error("-2147483649") == ERR_OUT_OF_RANGE);
+}
+
+/* E04-05 */ static void test_very_long_number(void)
+{
+    CHECK(first_error("999999999999999999999999999999") == ERR_OUT_OF_RANGE);
+    CHECK(first_error("-999999999999999999999999999999") == ERR_OUT_OF_RANGE);
+}
+
+/* E04-06 */ static void test_leading_zeros(void)
+{
+    CHECK(single_int("007") == 7);
+}
+
+/* E04-07 */ static void test_negative_zero(void)
+{
+    CHECK(single_int("-0") == 0);
+}
+
+/* E04-08 */ static void test_minus_followed_by_space(void)
+{
+    CHECK(first_error("- 5") == ERR_SYNTAX);
+}
+
+/* E04-09 */ static void test_double_minus_starts_comment(void)
+{
+    const char *sql = "age = --5";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    CHECK(next_ok(&tokenizer).type == TOK_IDENT);
+    CHECK(next_ok(&tokenizer).type == TOK_EQ);
+    CHECK(next_ok(&tokenizer).type == TOK_EOF);
+}
+
+/* E04-10 */ static void test_number_followed_by_letters(void)
+{
+    CHECK(first_error("12abc") == ERR_SYNTAX);
+}
+
+/* E04-11 */ static void test_empty_string(void)
+{
+    check_single_string("''", "", 0);
+}
+
+/* E04-12 */ static void test_string_of_single_quote(void)
+{
+    check_single_string("''''", "'", 1);
+}
+
+/* E04-13 */ static void test_unterminated_string_reports_start_line(void)
+{
+    const char *sql = "SELECT\n'kim\nlee";
+    TokenizeFailure failure = first_failure(sql, strlen(sql));
+    CHECK(failure.error == ERR_SYNTAX);
+    CHECK(failure.line == 2);
+}
+
+/* E04-14 */ static void test_multiline_string(void)
+{
+    const char *sql = "'a\nb' x";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    Token string = next_ok(&tokenizer);
+    CHECK(string.type == TOK_STRING);
+    CHECK(string.line == 1);
+    char text[4];
+    tokenizer_copy_string(&string, text);
+    CHECK_STR_EQ(text, "a\nb");
+    CHECK(next_ok(&tokenizer).line == 2);
+}
+
+/* E04-15 */ static void test_double_minus_inside_string(void)
+{
+    check_single_string("'a--b'", "a--b", 4);
+}
+
+/* E04-16 */ static void test_quote_inside_comment(void)
+{
+    const char *sql = "-- it's\nSELECT";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    Token token = next_ok(&tokenizer);
+    CHECK(token.keyword == KW_SELECT);
+    CHECK(token.line == 2);
+}
+
+/* E04-17 */ static void test_comment_at_end_without_newline(void)
+{
+    const char *sql = "SELECT -- end";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    CHECK(next_ok(&tokenizer).keyword == KW_SELECT);
+    CHECK(next_ok(&tokenizer).type == TOK_EOF);
+}
+
+/* E04-18 */ static void test_nul_byte_inside_string(void)
+{
+    const char sql[] = { '\'', 'a', '\0', 'b', '\'' };
+    CHECK(first_failure(sql, sizeof(sql)).error == ERR_SYNTAX);
+}
+
+/* E04-19 */ static void test_question_mark_inside_string(void)
+{
+    check_single_string("'what?'", "what?", 5);
+}
+
+/* E04-20 */ static void test_backslash_is_plain_character(void)
+{
+    const char *sql = "'a\\'b'";
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, sql, strlen(sql));
+
+    Token string = next_ok(&tokenizer);
+    CHECK(string.type == TOK_STRING);
+    CHECK(string.string_len == 2); /* a\ */
+    CHECK(next_ok(&tokenizer).type == TOK_IDENT);
+    Token token;
+    CHECK(tokenizer_next(&tokenizer, &token) == ERR_SYNTAX); /* 닫히지 않은 ' */
+}
+
+/* 문장 하나(첫 토큰 ~ 마지막 토큰)가 MAX_SQL_LEN 바이트를 넘으면 ERR_TOO_LARGE, ; 뒤 문장은 새로 센다 */
+static char *make_string_statement(size_t statement_len)
+{
+    /* 'xxx...x'; SELECT  — 문자열 토큰이 statement_len 바이트 */
+    const char *tail = "; SELECT";
+    char *sql = malloc(statement_len + strlen(tail) + 1);
+    CHECK(sql != NULL);
+    memset(sql, 'x', statement_len);
+    sql[0] = '\'';
+    sql[statement_len - 1] = '\'';
+    strcpy(sql + statement_len, tail);
+    return sql;
+}
+
+static void test_statement_size_limit(void)
+{
+    char *exact = make_string_statement(MAX_SQL_LEN);
+    CHECK(first_error(exact) == ERR_NONE);
+    free(exact);
+
+    char *too_large = make_string_statement(MAX_SQL_LEN + 1);
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, too_large, strlen(too_large));
+    Token token;
+    CHECK(tokenizer_next(&tokenizer, &token) == ERR_TOO_LARGE);
+    CHECK(next_ok(&tokenizer).type == TOK_SEMI);
+    CHECK(next_ok(&tokenizer).keyword == KW_SELECT); /* 다음 문장은 정상 */
+    free(too_large);
+}
+
 int main(void)
 {
     RUN(test_keywords_ignore_case);
@@ -276,6 +536,36 @@ int main(void)
     RUN(test_non_ascii_identifier);
     RUN(test_nul_byte_in_input);
     RUN(test_tokenizer_advances_after_error);
+
+    RUN(test_integer);
+    RUN(test_negative_integer);
+    RUN(test_string);
+    RUN(test_string_quote_escape);
+    RUN(test_string_with_spaces);
+    RUN(test_korean_string);
+    RUN(test_line_comment);
+    RUN(test_placeholders_are_numbered);
+    RUN(test_int_max);
+    RUN(test_int_max_plus_one);
+    RUN(test_int_min);
+    RUN(test_int_min_minus_one);
+    RUN(test_very_long_number);
+    RUN(test_leading_zeros);
+    RUN(test_negative_zero);
+    RUN(test_minus_followed_by_space);
+    RUN(test_double_minus_starts_comment);
+    RUN(test_number_followed_by_letters);
+    RUN(test_empty_string);
+    RUN(test_string_of_single_quote);
+    RUN(test_unterminated_string_reports_start_line);
+    RUN(test_multiline_string);
+    RUN(test_double_minus_inside_string);
+    RUN(test_quote_inside_comment);
+    RUN(test_comment_at_end_without_newline);
+    RUN(test_nul_byte_inside_string);
+    RUN(test_question_mark_inside_string);
+    RUN(test_backslash_is_plain_character);
+    RUN(test_statement_size_limit);
     TEST_DONE();
     return 0;
 }

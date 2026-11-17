@@ -1,5 +1,6 @@
 #include "tokenizer.h"
 
+#include <assert.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -78,11 +79,23 @@ static ErrorCode fail(Tokenizer *tokenizer, ErrorCode code, const char *format, 
     return code;
 }
 
-/* 줄 번호는 \n 만 센다. \r 은 공백으로 넘기므로 \r\n 도 한 줄이 된다 */
-static void skip_whitespace(Tokenizer *tokenizer)
+/* -- 부터 줄 끝까지. \n 은 남겨 두어 줄 번호를 skip_whitespace_and_comments 가 세게 한다 */
+static void skip_line_comment(Tokenizer *tokenizer)
+{
+    while (!is_at_end(tokenizer) && peek(tokenizer, 0) != '\n')
+        tokenizer->pos++;
+}
+
+/* 줄 번호는 \n 만 센다. \r 은 공백으로 넘기므로 \r\n 도 한 줄이 된다.
+ * 주석은 문자열 밖에서만 여기로 오므로 '...--...' 안의 -- 는 주석이 아니다 */
+static void skip_whitespace_and_comments(Tokenizer *tokenizer)
 {
     while (!is_at_end(tokenizer)) {
         unsigned char c = peek(tokenizer, 0);
+        if (c == '-' && peek(tokenizer, 1) == '-') {
+            skip_line_comment(tokenizer);
+            continue;
+        }
         if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
             return;
         if (c == '\n')
@@ -145,27 +158,63 @@ static ErrorCode scan_word(Tokenizer *tokenizer, Token *token)
     return ERR_NONE;
 }
 
+/* 선택적 - 와 숫자. - 바로 뒤에 숫자가 있을 때만 여기로 온다 ("- 5" 는 reject_character) */
 static ErrorCode scan_number(Tokenizer *tokenizer, Token *token)
 {
+    bool is_negative = peek(tokenizer, 0) == '-';
+    if (is_negative)
+        tokenizer->pos++;
     size_t len = consume_word(tokenizer, token);
-    int64_t value = 0;
-    bool is_out_of_range = false;
+    size_t sign_len = is_negative ? 1 : 0;
 
-    for (size_t i = 0; i < len; i++) {
+    /* 절댓값으로 세고 부호는 마지막에 붙인다. 음수 쪽 한계가 1 크다 (-2147483648 은 되고 2147483648 은 안 됨).
+     * 한계를 넘으면 누적을 멈추므로 아주 긴 숫자에서도 int64 가 넘치지 않는다 */
+    int64_t limit = is_negative ? -(int64_t)INT32_MIN : INT32_MAX;
+    int64_t magnitude = 0;
+    for (size_t i = sign_len; i < len; i++) {
         unsigned char c = (unsigned char)token->start[i];
         if (!is_digit(c))
             return fail(tokenizer, ERR_SYNTAX, "invalid number '%.*s'", (int)len, token->start);
-        /* INT32_MAX 를 넘는 순간 누적을 멈춰 아주 긴 숫자에서도 int64 가 넘치지 않게 한다 */
-        if (!is_out_of_range)
-            value = value * DECIMAL_BASE + (c - '0');
-        if (value > INT32_MAX)
-            is_out_of_range = true;
+        if (magnitude <= limit)
+            magnitude = magnitude * DECIMAL_BASE + (c - '0');
     }
-    if (is_out_of_range)
+    if (magnitude > limit)
         return fail(tokenizer, ERR_OUT_OF_RANGE, "integer '%.*s' out of INT range", (int)len,
                     token->start);
     token->type = TOK_INT;
-    token->int_value = (int32_t)value;
+    token->int_value = (int32_t)(is_negative ? -magnitude : magnitude);
+    return ERR_NONE;
+}
+
+/* 작은따옴표 문자열. 값을 복사하지 않고 길이만 세 두고, 값은 tokenizer_copy_string 이 원문에서 푼다.
+ * 그래서 Token 이 힙을 갖지 않아 토큰마다 해제할 필요가 없다 */
+static ErrorCode scan_string(Tokenizer *tokenizer, Token *token)
+{
+    bool has_nul = false;
+    tokenizer->pos++; /* 여는 ' */
+    for (;;) {
+        if (is_at_end(tokenizer)) {
+            token->len = tokenizer->len - (size_t)(token->start - tokenizer->sql);
+            return fail(tokenizer, ERR_SYNTAX, "unterminated string starting at line %d",
+                        token->line);
+        }
+        unsigned char c = peek(tokenizer, 0);
+        if (c == '\'' && peek(tokenizer, 1) != '\'')
+            break;
+        if (c == '\'')
+            tokenizer->pos++; /* '' 의 첫 번째 ' 를 건너뛰고 두 번째를 값으로 센다 */
+        else if (c == '\n')
+            tokenizer->line++;
+        else if (c == '\0')
+            has_nul = true;
+        tokenizer->pos++;
+        token->string_len++;
+    }
+    tokenizer->pos++; /* 닫는 ' */
+    token->len = (size_t)(tokenizer->sql + tokenizer->pos - token->start);
+    if (has_nul)
+        return fail(tokenizer, ERR_SYNTAX, "NUL byte in string");
+    token->type = TOK_STRING;
     return ERR_NONE;
 }
 
@@ -195,6 +244,8 @@ static ErrorCode reject_character(Tokenizer *tokenizer, unsigned char c)
         return fail(tokenizer, ERR_SYNTAX, "use single quotes for strings");
     if (c == '\0')
         return fail(tokenizer, ERR_SYNTAX, "NUL byte in input");
+    if (c == '-')
+        return fail(tokenizer, ERR_SYNTAX, "expected digits right after '-'");
     if (c < ' ' || c > '~')
         return fail(tokenizer, ERR_SYNTAX, "unexpected byte 0x%02x", c);
     return fail(tokenizer, ERR_SYNTAX, "unexpected character '%c'", c);
@@ -205,6 +256,10 @@ static ErrorCode scan_symbol(Tokenizer *tokenizer, Token *token)
     unsigned char c = peek(tokenizer, 0);
     if (c == '<' || c == '>' || c == '!')
         return scan_comparison(tokenizer, token, c);
+    if (c == '?') {
+        token->param_index = tokenizer->param_count++;
+        return emit(tokenizer, token, TOK_PARAM, 1);
+    }
 
     for (size_t i = 0; i < sizeof(SINGLE_SYMBOLS) / sizeof(SINGLE_SYMBOLS[0]); i++) {
         if (SINGLE_SYMBOLS[i].symbol == (char)c)
@@ -221,22 +276,67 @@ void tokenizer_init(Tokenizer *tokenizer, const char *sql, size_t len)
     tokenizer->line = 1;
 }
 
-ErrorCode tokenizer_next(Tokenizer *tokenizer, Token *out_token)
+static ErrorCode scan_token(Tokenizer *tokenizer, Token *token)
 {
-    skip_whitespace(tokenizer);
-    memset(out_token, 0, sizeof(*out_token));
-    out_token->line = tokenizer->line;
-    out_token->start = tokenizer->sql + tokenizer->pos;
-
     if (is_at_end(tokenizer)) {
-        out_token->type = TOK_EOF;
+        token->type = TOK_EOF;
         return ERR_NONE;
     }
 
     unsigned char c = peek(tokenizer, 0);
     if (is_letter(c) || c == '_' || is_non_ascii(c))
-        return scan_word(tokenizer, out_token);
-    if (is_digit(c))
-        return scan_number(tokenizer, out_token);
-    return scan_symbol(tokenizer, out_token);
+        return scan_word(tokenizer, token);
+    if (is_digit(c) || (c == '-' && is_digit(peek(tokenizer, 1))))
+        return scan_number(tokenizer, token);
+    if (c == '\'')
+        return scan_string(tokenizer, token);
+    return scan_symbol(tokenizer, token);
+}
+
+/* 문장 크기는 ; 로 끊어 센다. 넘친 문장에서 한 번만 알리고, 나머지 토큰은 그대로 돌려주어
+ * 호출한 쪽이 평소처럼 ; 까지 건너뛰고 다음 문장으로 넘어갈 수 있게 한다 */
+static ErrorCode check_statement_size(Tokenizer *tokenizer, const Token *token)
+{
+    if (token->type == TOK_SEMI || token->type == TOK_EOF) {
+        tokenizer->is_in_statement = false;
+        return ERR_NONE;
+    }
+    if (!tokenizer->is_in_statement) {
+        tokenizer->is_in_statement = true;
+        tokenizer->statement_start = (size_t)(token->start - tokenizer->sql);
+        tokenizer->is_too_large_reported = false;
+    }
+    size_t statement_len = tokenizer->pos - tokenizer->statement_start;
+    if (statement_len <= MAX_SQL_LEN || tokenizer->is_too_large_reported)
+        return ERR_NONE;
+    tokenizer->is_too_large_reported = true;
+    return fail(tokenizer, ERR_TOO_LARGE, "statement longer than %d bytes", MAX_SQL_LEN);
+}
+
+ErrorCode tokenizer_next(Tokenizer *tokenizer, Token *out_token)
+{
+    skip_whitespace_and_comments(tokenizer);
+    memset(out_token, 0, sizeof(*out_token));
+    out_token->line = tokenizer->line;
+    out_token->start = tokenizer->sql + tokenizer->pos;
+
+    ErrorCode error = scan_token(tokenizer, out_token);
+    if (error != ERR_NONE)
+        return error;
+    return check_statement_size(tokenizer, out_token);
+}
+
+void tokenizer_copy_string(const Token *token, char *out_text)
+{
+    assert(token->type == TOK_STRING);
+    /* 원문은 '...' 이고 안의 '' 는 반드시 짝으로 나온다 (scan_string 이 확인함) */
+    const char *body = token->start + 1;
+    const char *body_end = token->start + token->len - 1;
+    size_t written = 0;
+    for (const char *p = body; p < body_end; p++) {
+        out_text[written++] = *p;
+        if (*p == '\'')
+            p++;
+    }
+    out_text[written] = '\0';
 }
