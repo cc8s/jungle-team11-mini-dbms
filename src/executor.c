@@ -3,12 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "btree.h"
 #include "table.h"
 
 /* 스캔은 레코드를 SCAN_BATCH 개씩 pread 한 번으로 읽는다 (행마다 시스템 콜을 하지 않기 위해) */
 #define SCAN_BATCH 256
 #define INITIAL_ROW_CAPACITY 16
 #define NO_LIMIT (-1)
+#define ID_COLUMN_NAME "id"
 
 /* id 를 받아 레코드를 만들고 덧붙인다. 실패하면 next_id 가 그대로라 id 를 소모하지 않는다 */
 static Result execute_insert(const InsertStmt *insert, const Plan *plan, int line)
@@ -145,7 +147,119 @@ static ErrorCode scan_table(Scan *scan, uint8_t *batch)
     return ERR_NONE;
 }
 
-static Result select_result(const Plan *plan, RowBuffer *buffer)
+/* ---- SELECT: id 인덱스 경로 ---- */
+
+/* id 조건이 허용하는 키 구간 [low, high]. int64 로 둬서 "id > INT32_MAX" 의 v + 1,
+ * "id < INT32_MIN" 의 v - 1 이 넘치지 않는다 (그 경우 low > high 인 빈 구간이 된다) */
+typedef struct {
+    int64_t low;
+    int64_t high;
+} IdRange;
+
+/* 아직 읽지 않은, offset 이 연속인 레코드 묶음 */
+typedef struct {
+    uint64_t first_offset;
+    int32_t count;
+} OffsetRun;
+
+/* WHERE 가 id 조건이고 != 가 아니면 인덱스를 쓴다. != 는 거의 전부가 맞으므로 인덱스 이점이 없다.
+ * 인덱스가 없는 테이블 (테스트에서 끈 경우) 은 선형 탐색 */
+static bool can_use_id_index(const SelectStmt *select, const Plan *plan)
+{
+    return plan->has_where && strcmp(select->where.column, ID_COLUMN_NAME) == 0 &&
+           select->where.op != OP_NE && table_index(plan->table) != NULL;
+}
+
+static IdRange id_range_of(const Condition *where)
+{
+    int64_t value = where->value.i;
+    IdRange range = {INT32_MIN, INT32_MAX};
+    switch (where->op) {
+    case OP_EQ: range.low = value; range.high = value; break;
+    case OP_GT: range.low = value + 1; break;
+    case OP_GE: range.low = value; break;
+    case OP_LT: range.high = value - 1; break;
+    case OP_LE: range.high = value; break;
+    case OP_NE: break; /* can_use_id_index 가 걸러서 오지 않는다 */
+    }
+    return range;
+}
+
+/* 묶음을 한 번의 pread 로 읽어 결과에 붙인다. 구간 안의 키만 모았으므로 조건 검사도 모두 통과한다 */
+static ErrorCode flush_run(Scan *scan, OffsetRun *run, uint8_t *batch)
+{
+    if (run->count == 0)
+        return ERR_NONE;
+    ErrorCode error = table_read_records_at(scan->plan->table, run->first_offset, run->count,
+                                            batch);
+    if (error != ERR_NONE)
+        return error;
+    bool is_collected = collect_batch(scan, batch, run->count);
+    run->count = 0;
+    return is_collected ? ERR_NONE : ERR_INTERNAL;
+}
+
+/* offset 이 묶음의 바로 다음 레코드이고 묶음이 꽉 차지 않았으면 이어 붙일 수 있다.
+ * id 가 1 부터 빈틈없이 이어지므로 범위 결과는 사실상 한 덩어리지만, 연속인지는 offset 으로 확인한다 */
+static bool can_extend_run(const Scan *scan, const OffsetRun *run, uint64_t offset)
+{
+    return run->count > 0 && run->count < SCAN_BATCH &&
+           offset == run->first_offset + (uint64_t)run->count * scan->buffer.record_size;
+}
+
+/* 이미 모은 행 + 읽으려고 묶어 둔 행이 LIMIT 에 닿았는지 (닿으면 더 순회하지 않는다) */
+static bool is_planned_limit_reached(const Scan *scan, const OffsetRun *run)
+{
+    return scan->limit != NO_LIMIT && scan->buffer.count + run->count >= scan->limit;
+}
+
+/* = : 트리에서 한 번 찾고 레코드 1 개만 읽는다. 없는 id (0, 음수, max 초과) 는 읽기 없이 빈 결과 */
+static ErrorCode scan_index_equal(Scan *scan, int32_t id, uint8_t *batch)
+{
+    uint64_t offset = 0;
+    if (is_limit_reached(scan) || !btree_search(table_index(scan->plan->table), id, &offset))
+        return ERR_NONE;
+    OffsetRun run = {offset, 1};
+    return flush_run(scan, &run, batch);
+}
+
+/* 범위: low 이상 첫 키부터 (low 가 없으면 맨 왼쪽부터) 리프 연결을 따라가다 high 를 넘으면 멈춘다 */
+static ErrorCode scan_index_range(Scan *scan, IdRange range, uint8_t *batch)
+{
+    const BTree *index = table_index(scan->plan->table);
+    BTreeIter iter = range.low <= INT32_MIN ? btree_seek_first(index)
+                                            : btree_seek(index, (int32_t)range.low);
+    OffsetRun run = {0, 0};
+    int32_t key = 0;
+    uint64_t offset = 0;
+    while (!is_planned_limit_reached(scan, &run) && btree_iter_next(&iter, &key, &offset)) {
+        if (key > range.high)
+            break;
+        if (!can_extend_run(scan, &run, offset)) {
+            ErrorCode error = flush_run(scan, &run, batch);
+            if (error != ERR_NONE)
+                return error;
+            run.first_offset = offset;
+        }
+        run.count++;
+    }
+    return flush_run(scan, &run, batch);
+}
+
+static ErrorCode scan_index(Scan *scan, uint8_t *batch)
+{
+    const Condition *where = &scan->select->where;
+    if (where->op == OP_EQ)
+        return scan_index_equal(scan, where->value.i, batch);
+    IdRange range = id_range_of(where);
+    if (range.low > range.high) /* id > INT32_MAX, id < INT32_MIN: 읽을 것이 없다 */
+        return ERR_NONE;
+    return scan_index_range(scan, range, batch);
+}
+
+/* ---- SELECT: 결과 ---- */
+
+static Result select_result(const Plan *plan, RowBuffer *buffer, bool used_index)
 {
     Result result;
     result_init(&result);
@@ -154,7 +268,7 @@ static Result select_result(const Plan *plan, RowBuffer *buffer)
     result.record_size = (int)buffer->record_size;
     result.row_count = buffer->count;
     result.rows = buffer->rows; /* 소유권을 Result 로 넘긴다 (result_free 가 해제) */
-    result.used_index = false;  /* Phase 2 에서 id 조건이면 인덱스 경로 */
+    result.used_index = used_index;
     return result;
 }
 
@@ -169,10 +283,11 @@ static Result execute_select(const SelectStmt *select, const Plan *plan, int lin
     uint8_t *batch = malloc((size_t)SCAN_BATCH * scan.buffer.record_size);
     if (batch == NULL)
         return result_error(ERR_INTERNAL, line, "out of memory");
-    ErrorCode error = scan_table(&scan, batch);
+    bool use_index = can_use_id_index(select, plan);
+    ErrorCode error = use_index ? scan_index(&scan, batch) : scan_table(&scan, batch);
     free(batch);
     if (error == ERR_NONE)
-        return select_result(plan, &scan.buffer);
+        return select_result(plan, &scan.buffer, use_index);
     free(scan.buffer.rows);
     if (error == ERR_IO)
         return result_error(error, line, "could not read table '%s'", table_name(plan->table));

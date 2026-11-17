@@ -8,6 +8,7 @@
 #include "error.h"
 #include "result.h"
 #include "statement.h"
+#include "table.h"
 
 typedef struct Engine Engine;
 
@@ -16,6 +17,15 @@ typedef struct Engine Engine;
  * *out_error (ERR_IO, ERR_CORRUPT, ERR_INTERNAL) 와 out_message (문제 파일 이름 포함) 를 채운다. */
 Engine *engine_open(const char *data_dir, ErrorCode *out_error, char out_message[MAX_MESSAGE]);
 void engine_close(Engine *engine);
+
+/* engine_open 이 테이블을 열며 남긴 경고 수와 index 번째 문장 (0 <= index < count).
+ * 지금은 헤더 복구 ("table 'users' header recovered: ...") 뿐이다. 엔진은 출력하지 않으므로
+ * CLI·서버가 꺼내서 stderr 등에 낸다. 문자열은 engine_close 까지 유효하다. */
+int engine_warning_count(const Engine *engine);
+const char *engine_warning(const Engine *engine, int index);
+
+/* 이름이 name 인 테이블 (인덱스·재구축 시간 조회, 테스트·벤치마크용). 없으면 NULL */
+const Table *engine_find_table(const Engine *engine, const char *name);
 
 /* sql 한 문장을 실행한다 (단일 문장 모드: 두 번째 문장은 ERR_UNSUPPORTED, 빈 입력은 ERR_SYNTAX).
  * 결과는 호출한 쪽이 result_free 한다. params 는 Phase 3 바인딩용 (지금은 param_count = 0 만). */

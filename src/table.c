@@ -6,7 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "table_internal.h"
 
 /* 헤더 레이아웃 (계획서 3.1). 오프셋 계산은 이 파일에만 둔다 */
 #define MAGIC_OFFSET 0
@@ -176,13 +179,6 @@ ErrorCode table_create(const char *path, const CreateStmt *create)
 
 /* ---- 열기 ---- */
 
-struct Table {
-    int fd;
-    char name[MAX_NAME];
-    TableHeader header;
-    int32_t column_offsets[MAX_COLUMNS]; /* 레코드 안에서 각 컬럼이 시작하는 바이트 */
-};
-
 static bool is_valid_column(const ColumnDef *column)
 {
     if (column->name[0] == '\0')
@@ -251,8 +247,8 @@ static bool extract_table_name(const char *path, char out_name[MAX_NAME])
     return true;
 }
 
-/* 열린 fd 에서 헤더를 읽어 검사한다 */
-static ErrorCode load_header(int fd, TableHeader *out_header)
+/* 열린 fd 에서 헤더를 읽어 검사한다. 인덱스 재구축이 쓰도록 파일 크기도 돌려준다 */
+static ErrorCode load_header(int fd, TableHeader *out_header, off_t *out_file_size)
 {
     struct stat info;
     if (fstat(fd, &info) != 0)
@@ -263,6 +259,7 @@ static ErrorCode load_header(int fd, TableHeader *out_header)
     if (!read_all_at(fd, bytes, HEADER_SIZE, 0))
         return ERR_IO;
     table_header_decode(bytes, out_header);
+    *out_file_size = info.st_size;
     return is_valid_header(out_header, info.st_size) ? ERR_NONE : ERR_CORRUPT;
 }
 
@@ -275,6 +272,8 @@ static void compute_column_offsets(Table *table)
     }
 }
 
+static ErrorCode load_index(Table *table, off_t file_size);
+
 Table *table_open(const char *path, ErrorCode *out_error)
 {
     Table *table = calloc(1, sizeof(*table));
@@ -283,16 +282,20 @@ Table *table_open(const char *path, ErrorCode *out_error)
         return NULL;
     }
     table->fd = -1;
+    off_t file_size = 0;
     ErrorCode error = extract_table_name(path, table->name) ? ERR_NONE : ERR_CORRUPT;
     if (error == ERR_NONE) {
         table->fd = open(path, O_RDWR);
         error = table->fd < 0 ? ERR_IO : ERR_NONE;
     }
     if (error == ERR_NONE)
-        error = load_header(table->fd, &table->header);
+        error = load_header(table->fd, &table->header, &file_size);
+    if (error == ERR_NONE) {
+        compute_column_offsets(table);
+        error = load_index(table, file_size);
+    }
     if (error != ERR_NONE)
         goto cleanup;
-    compute_column_offsets(table);
     *out_error = ERR_NONE;
     return table;
 
@@ -308,7 +311,26 @@ void table_close(Table *table)
         return;
     if (table->fd >= 0)
         close(table->fd);
+    btree_destroy(table->index);
     free(table);
+}
+
+bool table_find_recovery(const Table *table, TableRecovery *out_recovery)
+{
+    if (!table->has_recovery)
+        return false;
+    *out_recovery = table->recovery;
+    return true;
+}
+
+const BTree *table_index(const Table *table)
+{
+    return table->index;
+}
+
+double table_index_build_ms(const Table *table)
+{
+    return table->index_build_ms;
 }
 
 const char *table_name(const Table *table)
@@ -404,8 +426,12 @@ static bool write_counters(Table *table, int32_t next_id, int32_t row_count)
     return write_all_at(table->fd, bytes, sizeof(bytes), NEXT_ID_OFFSET);
 }
 
-/* 순서: 레코드 → 헤더. 중간에 죽으면 파일 끝에 row_count 밖의 레코드가 남을 뿐이고
- * 열 때 그 부분은 무시된다 (S11, Phase 2 에서 복구). 메모리의 헤더는 두 쓰기가 다 끝난 뒤에만 바꾼다 */
+/* 순서: 레코드 → 헤더 → 인덱스.
+ * - 레코드를 쓰고 헤더 전에 죽으면 파일 끝에 row_count 밖의 레코드가 남고, 다음 열기에서 채택된다 (S25).
+ * - 파일 쓰기가 실패하면 인덱스에 등록하지 않는다: 인덱스에는 파일에 확정된 레코드만 있어야 한다.
+ * - 메모리의 헤더는 두 쓰기가 다 끝난 뒤에만 바꾼다.
+ * - 트리 삽입이 실패하면 (메모리 부족) ERR_INTERNAL. 레코드와 헤더는 이미 파일에 있으므로
+ *   되돌리지 않는다: 다음 table_open 의 재구축이 파일을 기준으로 인덱스를 다시 만든다. */
 ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_id)
 {
     int32_t id = table->header.next_id;
@@ -421,6 +447,8 @@ ErrorCode table_append_record(Table *table, const uint8_t *record, int32_t *out_
     table->header.next_id = id + 1;
     table->header.row_count++;
     *out_id = id;
+    if (btree_insert(table->index, id, (uint64_t)record_offset(table, id)) != BTREE_OK)
+        return ERR_INTERNAL;
     return ERR_NONE;
 }
 
@@ -439,6 +467,19 @@ ErrorCode table_read_records(const Table *table, int32_t first_id, int32_t count
     return ERR_NONE;
 }
 
+/* offset → id 는 record_offset 의 역산이다. 공식이 이 파일에만 있도록 여기서 되돌린다 */
+ErrorCode table_read_records_at(const Table *table, uint64_t offset, int32_t count,
+                                uint8_t *out_records)
+{
+    uint64_t record_size = (uint64_t)table->header.record_size;
+    if (offset < HEADER_SIZE || (offset - HEADER_SIZE) % record_size != 0)
+        return ERR_INTERNAL;
+    uint64_t index = (offset - HEADER_SIZE) / record_size;
+    if (index >= (uint64_t)table->header.row_count)
+        return ERR_INTERNAL;
+    return table_read_records(table, (int32_t)index + 1, count, out_records);
+}
+
 ErrorCode table_read_record(const Table *table, int32_t id, uint8_t *out_record)
 {
     return table_read_records(table, id, 1, out_record);
@@ -455,4 +496,119 @@ const char *table_record_string(const Table *table, const uint8_t *record, int c
     const char *field = (const char *)(record + table->column_offsets[column]);
     *out_len = strnlen(field, (size_t)table->header.columns[column].size);
     return field;
+}
+
+/* ---- 인덱스 재구축과 헤더 복구 ---- */
+
+#define REBUILD_BATCH_BYTES (1024 * 1024) /* 재구축 때 한 번의 pread 로 읽는 레코드 묶음 크기 */
+#define MAX_ROW_COUNT (INT32_MAX - 1)     /* next_id = row_count + 1 이 int32 안에 들어가야 한다 */
+#define MS_PER_SECOND 1000.0
+#define NS_PER_MS 1000000.0
+
+/* 파일에 끝까지 들어 있는 (반쪽이 아닌) 레코드 수. load_header 가 HEADER_SIZE 이상임을 확인했다 */
+static int32_t count_complete_records(const Table *table, off_t file_size)
+{
+    int64_t count = ((int64_t)file_size - HEADER_SIZE) / table->header.record_size;
+    return count > MAX_ROW_COUNT ? MAX_ROW_COUNT : (int32_t)count;
+}
+
+/* 묶음 records 의 레코드 count 개 (첫 id = first_id) 를 인덱스에 등록한다. 등록한 수는 *out_accepted.
+ * 위치 k 의 레코드 id 는 k 여야 한다 (offset 공식이 id 로 위치를 계산하므로).
+ * row_count 안에서 어긋나면 이미 확정된 데이터가 망가진 것이라 손상이고,
+ * 그 뒤에서 어긋나면 비정상 종료로 쓰다 만 꼬리라서 거기서 멈추고 나머지는 무시한다. */
+static ErrorCode index_batch(Table *table, const uint8_t *records, int32_t first_id,
+                             int32_t count, int32_t *out_accepted)
+{
+    size_t record_size = (size_t)table->header.record_size;
+    for (int32_t i = 0; i < count; i++) {
+        int32_t id = first_id + i;
+        if (read_i32_le(records + (size_t)i * record_size) != id) {
+            *out_accepted = i;
+            return id <= table->header.row_count ? ERR_CORRUPT : ERR_NONE;
+        }
+        if (btree_insert(table->index, id, (uint64_t)record_offset(table, id)) != BTREE_OK)
+            return ERR_INTERNAL; /* id 가 늘 증가하므로 중복은 없고, 실패는 메모리 부족뿐 */
+    }
+    *out_accepted = count;
+    return ERR_NONE;
+}
+
+/* 레코드 영역을 묶음 단위로 읽으며 인덱스를 채운다. 레코드마다 pread 하면 100 만 건에
+ * 시스템 콜 100 만 번이 들지만, 1MB 묶음이면 수십 번으로 끝난다.
+ * *out_valid_count 는 처음부터 id 가 이어지는 완전한 레코드 수 (= 실제 row_count). */
+static ErrorCode scan_records(Table *table, off_t file_size, int32_t *out_valid_count)
+{
+    int32_t complete_count = count_complete_records(table, file_size);
+    size_t record_size = (size_t)table->header.record_size;
+    int32_t batch_count = (int32_t)(REBUILD_BATCH_BYTES / record_size);
+    if (batch_count < 1)
+        batch_count = 1;
+    uint8_t *records = malloc((size_t)batch_count * record_size);
+    if (records == NULL)
+        return ERR_INTERNAL;
+
+    ErrorCode error = ERR_NONE;
+    int32_t valid_count = 0;
+    while (error == ERR_NONE && valid_count < complete_count) {
+        int32_t first_id = valid_count + 1;
+        int32_t count = complete_count - valid_count;
+        count = count < batch_count ? count : batch_count;
+        int32_t accepted = 0;
+        if (!read_all_at(table->fd, records, (size_t)count * record_size,
+                         record_offset(table, first_id)))
+            error = ERR_IO;
+        else
+            error = index_batch(table, records, first_id, count, &accepted);
+        valid_count += accepted;
+        if (accepted < count)
+            break;
+    }
+    free(records);
+    *out_valid_count = valid_count;
+    return error;
+}
+
+/* 실제 레코드 수에 맞춰 헤더의 row_count, next_id 를 바로잡는다. 맞으면 아무것도 쓰지 않는다.
+ * 파일을 먼저 쓰고 성공한 뒤에 메모리 헤더를 바꾼다 (실패하면 열기 전체가 실패). */
+static ErrorCode recover_header(Table *table, int32_t valid_count)
+{
+    TableHeader *header = &table->header;
+    int32_t next_id = valid_count + 1;
+    if (header->row_count == valid_count && header->next_id == next_id)
+        return ERR_NONE;
+    if (!write_counters(table, next_id, valid_count))
+        return ERR_IO;
+    table->recovery.old_row_count = header->row_count;
+    table->recovery.old_next_id = header->next_id;
+    table->recovery.row_count = valid_count;
+    table->recovery.next_id = next_id;
+    table->has_recovery = true;
+    header->row_count = valid_count;
+    header->next_id = next_id;
+    return ERR_NONE;
+}
+
+static double elapsed_ms_since(const struct timespec *start)
+{
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (double)(end.tv_sec - start->tv_sec) * MS_PER_SECOND +
+           (double)(end.tv_nsec - start->tv_nsec) / NS_PER_MS;
+}
+
+/* 파일 전체를 스캔해 인덱스를 만들고 헤더를 복구한다. 걸린 시간을 기록한다.
+ * 엔진이 서버를 시작하기 전 (engine_open) 에 끝나므로 락이 필요 없다. */
+static ErrorCode load_index(Table *table, off_t file_size)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    table->index = btree_create();
+    if (table->index == NULL)
+        return ERR_INTERNAL;
+    int32_t valid_count = 0;
+    ErrorCode error = scan_records(table, file_size, &valid_count);
+    if (error == ERR_NONE)
+        error = recover_header(table, valid_count);
+    table->index_build_ms = elapsed_ms_since(&start);
+    return error;
 }
