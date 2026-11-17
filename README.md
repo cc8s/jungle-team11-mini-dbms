@@ -109,7 +109,9 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 | 기능 | `test_engine` `test_cli` — 엔진 열기/INSERT/SELECT/스크립트, CLI 옵션·종료 코드·init |
 | 통합 | `test_integration` — init → 100 건 INSERT → 조건별 SELECT, 재실행 후 데이터 유지, 문장 1,000 개 혼합 스크립트, 테이블 2 개 교차 |
 | 동시성 | Phase 3 |
+| B+ 트리 | `test_btree` — split 경계, 범위 순회, 오름·내림·무작위 10 만 건. `make test` 가 `BTREE_ORDER` 3, 4 빌드로 한 번 더 돌림 (`make test-order`) |
 | 메모리 | `make test-asan` — 전체 테스트를 AddressSanitizer 로 다시 돌려 누수·오버플로 확인 |
+| 느린 테스트 | `make test-slow` — 100 만 건 트리를 일반·ASan 빌드에서 검사 (`MINIDB_SLOW_TESTS=1`) |
 
 알려진 한계: 표의 열 너비는 UTF-8 글자 수로 맞추므로 한글처럼 화면 폭이 2 칸인 글자가 있으면 선이 어긋나 보인다.
 

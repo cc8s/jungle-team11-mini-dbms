@@ -373,7 +373,7 @@ static void test_split_middle_leaf_keeps_chain(void)
     for (int32_t key = middle_first + 1; count_leaves(tree) < 4; key += KEY_GAP / 2)
         CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
 
-    CHECK(btree_height(tree) == 2);
+    /* 높이는 보지 않는다: ORDER = 3 이면 루트가 자식 3 개까지라 리프 4 개째에 내부 split 도 일어난다 */
     CHECK(middle->next != right); /* 새 리프가 가운데와 오른쪽 사이에 들어감 */
     CHECK(middle->next->next == right);
     CHECK(right->next == NULL);
@@ -709,9 +709,123 @@ static void test_seek_leaf_first_and_last_key(void)
     destroy_checked(tree);
 }
 
+/* ---- S24 트리 견고성 ---- */
+
+#define BULK_KEY_COUNT 100000
+#define SLOW_KEY_COUNT 1000000
+#define RANDOM_SEED 20241117u       /* 고정 시드: 매번 같은 순서로 돈다 */
+#define DUPLICATE_EVERY 7           /* E24-01: 이 간격마다 이미 넣은 키를 다시 넣는다 */
+#define SLOW_TESTS_ENV "MINIDB_SLOW_TESTS"
+#define DEFAULT_ORDER 128
+#define MILLION_ASCENDING_HEIGHT 4 /* ORDER 128, 100 만 건 오름차순 (T24-04) */
+
+/* xorshift32. 시드가 같으면 수열이 같아서 무작위 테스트가 재현된다 (rand 는 구현마다 다름).
+ * 상태를 인자로 받아 전역이 없다. 상태가 0 이면 0 만 나오므로 시드는 0 이 아니어야 한다 */
+static uint32_t xorshift32(uint32_t *state)
+{
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+/* 1..count 를 Fisher-Yates 로 섞은 배열 (호출한 쪽이 free) */
+static int32_t *create_shuffled_keys(int count, uint32_t seed)
+{
+    int32_t *keys = malloc((size_t)count * sizeof(keys[0]));
+    CHECK(keys != NULL);
+    for (int i = 0; i < count; i++)
+        keys[i] = i + 1;
+    uint32_t state = seed;
+    for (int i = count - 1; i > 0; i--) {
+        int j = (int)(xorshift32(&state) % (uint32_t)(i + 1));
+        int32_t saved = keys[i];
+        keys[i] = keys[j];
+        keys[j] = saved;
+    }
+    return keys;
+}
+
+static void check_bulk_tree(BTree *tree, int count)
+{
+    CHECK(btree_size(tree) == count);
+    CHECK(btree_check(tree));
+    check_all_found(tree, 1, count, 1);
+    BTreeIter iter = btree_seek_first(tree);
+    check_iter_sequence(&iter, 1, 1, count);
+    check_iter_exhausted(&iter);
+}
+
+/* T24-01, T24-05 (ORDER = 4 빌드에서 같은 테스트) */
+static void test_bulk_ascending(void)
+{
+    BTree *tree = create_range_tree(1, 1, BULK_KEY_COUNT);
+    check_bulk_tree(tree, BULK_KEY_COUNT);
+    destroy_checked(tree);
+}
+
+/* T24-02, T24-05 */
+static void test_bulk_descending(void)
+{
+    BTree *tree = create_range_tree(BULK_KEY_COUNT, -1, BULK_KEY_COUNT);
+    check_bulk_tree(tree, BULK_KEY_COUNT);
+    destroy_checked(tree);
+}
+
+/* T24-03, T24-05 */
+static void test_bulk_random(void)
+{
+    int32_t *keys = create_shuffled_keys(BULK_KEY_COUNT, RANDOM_SEED);
+    BTree *tree = create_tree();
+    for (int i = 0; i < BULK_KEY_COUNT; i++)
+        CHECK(btree_insert(tree, keys[i], (uint64_t)keys[i]) == BTREE_OK);
+    check_bulk_tree(tree, BULK_KEY_COUNT);
+    destroy_checked(tree);
+    free(keys);
+}
+
+/* E24-01 */
+static void test_bulk_random_with_duplicates(void)
+{
+    int32_t *keys = create_shuffled_keys(BULK_KEY_COUNT, RANDOM_SEED);
+    BTree *tree = create_tree();
+    uint32_t state = RANDOM_SEED;
+    for (int i = 0; i < BULK_KEY_COUNT; i++) {
+        CHECK(btree_insert(tree, keys[i], (uint64_t)keys[i]) == BTREE_OK);
+        if (i % DUPLICATE_EVERY != 0)
+            continue;
+        int32_t again = keys[xorshift32(&state) % (uint32_t)(i + 1)]; /* 이미 넣은 키 중 하나 */
+        CHECK(btree_insert(tree, again, SENTINEL_VALUE) == BTREE_DUPLICATE);
+    }
+    check_bulk_tree(tree, BULK_KEY_COUNT); /* 값이 SENTINEL 로 바뀌었으면 여기서 걸림 */
+    destroy_checked(tree);
+    free(keys);
+}
+
+/* T24-04, E24-02 (ASan 빌드로 돌리면 누수 검사) — make test-slow 에서만 */
+static void test_slow_million_ascending(void)
+{
+    BTree *tree = create_range_tree(1, 1, SLOW_KEY_COUNT);
+    check_bulk_tree(tree, SLOW_KEY_COUNT);
+    printf("    height = %d (ORDER %d)\n", btree_height(tree), BTREE_ORDER);
+    /* 오름차순은 반반 split 이라 리프에 64 키, 내부 노드에 65 자식만 남는다.
+     * 높이 3 의 용량은 약 128 × 65 × 64 ≈ 53 만이므로 100 만 건이면 높이 4 */
+    if (BTREE_ORDER == DEFAULT_ORDER)
+        CHECK(btree_height(tree) == MILLION_ASCENDING_HEIGHT);
+    destroy_checked(tree);
+}
+
+static bool is_slow_test_enabled(void)
+{
+    const char *flag = getenv(SLOW_TESTS_ENV);
+    return flag != NULL && strcmp(flag, "1") == 0;
+}
+
 int main(void)
 {
-    printf("test_btree\n");
+    printf("test_btree (ORDER %d)\n", BTREE_ORDER);
     RUN(test_create_empty_tree);
     RUN(test_insert_one_and_search);
     RUN(test_insert_shuffled_keeps_leaf_sorted);
@@ -749,6 +863,12 @@ int main(void)
     RUN(test_iter_next_after_end);
     RUN(test_seek_extreme_bounds);
     RUN(test_seek_leaf_first_and_last_key);
+    RUN(test_bulk_ascending);
+    RUN(test_bulk_descending);
+    RUN(test_bulk_random);
+    RUN(test_bulk_random_with_duplicates);
+    if (is_slow_test_enabled())
+        RUN(test_slow_million_ascending);
     TEST_DONE();
     return 0;
 }
