@@ -11,15 +11,23 @@
 #include "engine.h"
 #include "format.h"
 #include "parser.h"
+#include "server.h"
 #include "table.h"
 
 #define DEFAULT_DATA_DIR "data"
 #define INIT_COMMAND "init"
+#define SERVE_COMMAND "serve"
+#define SERVE_MIN_ARGS 2 /* <port> <threads> */
+#define SERVE_MAX_ARGS 3 /* [queue_cap] */
+#define SERVE_MAX_WORKERS 1024
+#define SERVE_MAX_QUEUE 1048576
+#define DECIMAL_BASE 10
 #define INIT_STATEMENT_INDEX 1
 
 static const char USAGE[] =
     "usage: minidb [-d <data_dir>] [-q] <file.sql>\n"
     "       minidb [-d <data_dir>] init <schema.sql>\n"
+    "       minidb [-d <data_dir>] serve <port> <threads> [queue_cap]\n"
     "  -d <data_dir>  data directory (default: " DEFAULT_DATA_DIR ")\n"
     "  -q             print only errors and a summary\n";
 
@@ -28,17 +36,31 @@ typedef struct {
     const char *file;
     bool is_init;
     bool is_quiet;
+    bool is_serve;
+    const char *serve_args[SERVE_MAX_ARGS]; /* port, threads, queue_cap */
+    int serve_arg_count;
 } CliOptions;
 
 /* ---- 옵션 ---- */
 
-/* 위치 인자: 첫 번째가 "init" 이면 다음 인자가 스키마 파일, 아니면 그것이 SQL 파일 */
+/* 위치 인자: 첫 번째가 "init" 이면 다음 인자가 스키마 파일, "serve" 면 다음 2~3 개가 서버 인자,
+ * 아니면 그것이 SQL 파일 */
 static bool take_positional(CliOptions *options, const char *arg)
 {
+    if (options->is_serve) {
+        if (options->serve_arg_count == SERVE_MAX_ARGS)
+            return false;
+        options->serve_args[options->serve_arg_count++] = arg;
+        return true;
+    }
     if (options->file != NULL)
         return false;
     if (!options->is_init && strcmp(arg, INIT_COMMAND) == 0) {
         options->is_init = true;
+        return true;
+    }
+    if (!options->is_init && strcmp(arg, SERVE_COMMAND) == 0) {
+        options->is_serve = true;
         return true;
     }
     options->file = arg;
@@ -63,6 +85,8 @@ static bool parse_options(int argc, char **argv, CliOptions *out_options)
         if (!is_ok)
             return false;
     }
+    if (out_options->is_serve)
+        return out_options->serve_arg_count >= SERVE_MIN_ARGS;
     return out_options->file != NULL;
 }
 
@@ -210,6 +234,77 @@ static int run_script(const CliOptions *options, const char *text, FILE *out, FI
     return error_count > 0 ? CLI_EXIT_SQL_ERROR : CLI_EXIT_OK;
 }
 
+static bool check_data_dir(const CliOptions *options, FILE *err)
+{
+    if (is_directory(options->data_dir))
+        return true;
+    fprintf(err, "minidb: data directory '%s' does not exist\n", options->data_dir);
+    return false;
+}
+
+/* ---- 서버 ---- */
+
+/* 부호 없는 10 진수만 받는다 ("80x", "-1", "" 는 실패). min..max 밖이어도 실패 */
+static bool parse_bounded_int(const char *text, long min, long max, int *out_value)
+{
+    if (text[0] < '0' || text[0] > '9')
+        return false;
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, DECIMAL_BASE);
+    if (errno != 0 || *end != '\0' || value < min || value > max)
+        return false;
+    *out_value = (int)value;
+    return true;
+}
+
+/* serve <port> <threads> [queue_cap] 를 ServerOptions 로. queue_cap 이 없으면 threads × 16 */
+static bool parse_serve_options(const CliOptions *options, ServerOptions *out_server)
+{
+    *out_server = server_default_options();
+    if (!parse_bounded_int(options->serve_args[0], 0, SERVER_MAX_PORT, &out_server->port) ||
+        !parse_bounded_int(options->serve_args[1], 1, SERVE_MAX_WORKERS,
+                           &out_server->worker_count))
+        return false;
+    out_server->queue_capacity = out_server->worker_count * SERVER_DEFAULT_QUEUE_PER_WORKER;
+    return options->serve_arg_count < SERVE_MAX_ARGS ||
+           parse_bounded_int(options->serve_args[2], 1, SERVE_MAX_QUEUE,
+                             &out_server->queue_capacity);
+}
+
+static int run_serve(const CliOptions *options, FILE *out, FILE *err)
+{
+    ServerOptions server_options;
+    if (!parse_serve_options(options, &server_options)) {
+        fputs(USAGE, err);
+        return CLI_EXIT_USAGE;
+    }
+    if (!check_data_dir(options, err))
+        return CLI_EXIT_USAGE;
+    ErrorCode error = ERR_NONE;
+    char message[MAX_MESSAGE];
+    Engine *engine = engine_open(options->data_dir, &error, message);
+    if (engine == NULL) {
+        fprintf(err, "minidb: %s\n", message);
+        return CLI_EXIT_USAGE;
+    }
+    for (int i = 0; i < engine_warning_count(engine); i++)
+        fprintf(err, "minidb: warning: %s\n", engine_warning(engine, i));
+    Server *server = server_create(engine, &server_options, message);
+    if (server == NULL) {
+        fprintf(err, "minidb: %s\n", message);
+        engine_close(engine);
+        return CLI_EXIT_USAGE;
+    }
+    fprintf(out, "minidb: listening on port %d (workers %d, queue %d)\n", server_port(server),
+            server_options.worker_count, server_options.queue_capacity);
+    fflush(out);
+    server_run(server);
+    server_destroy(server);
+    engine_close(engine);
+    return CLI_EXIT_OK;
+}
+
 /* ---- 진입점 ---- */
 
 int cli_run(int argc, char **argv, FILE *out, FILE *err)
@@ -219,10 +314,10 @@ int cli_run(int argc, char **argv, FILE *out, FILE *err)
         fputs(USAGE, err);
         return CLI_EXIT_USAGE;
     }
-    if (!is_directory(options.data_dir)) {
-        fprintf(err, "minidb: data directory '%s' does not exist\n", options.data_dir);
+    if (options.is_serve) /* 서버 인자를 먼저 검사하고 (사용법), 그다음 디렉터리를 본다 */
+        return run_serve(&options, out, err);
+    if (!check_data_dir(&options, err))
         return CLI_EXIT_USAGE;
-    }
     size_t len = 0;
     char *text = read_text_file(options.file, &len, err);
     if (text == NULL)
