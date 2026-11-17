@@ -212,6 +212,232 @@ static void test_close_null_is_safe(void)
     engine_close(NULL);
 }
 
+/* ---- S15: SELECT ---- */
+
+#define BATCH_EDGE_ROWS 257  /* 스캔 묶음(256) 경계를 넘는 행 수 */
+#define MANY_ROWS 10000
+#define USERS_NAME_COLUMN 1
+#define INSERT_SQL_MAX 128
+
+/* kim 25, lee 30, park 22 를 넣은 users 테이블 */
+static TestDb open_people(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    insert_ok(db.engine, "INSERT INTO users VALUES ('kim', 25)");
+    insert_ok(db.engine, "INSERT INTO users VALUES ('lee', 30)");
+    insert_ok(db.engine, "INSERT INTO users VALUES ('park', 22)");
+    return db;
+}
+
+static Result select_ok(Engine *engine, const char *sql)
+{
+    Result result = engine_execute(engine, sql, NULL, 0);
+    CHECK(result.error == ERR_NONE);
+    CHECK(!result.used_index);
+    return result;
+}
+
+static int64_t select_count(Engine *engine, const char *sql)
+{
+    Result result = select_ok(engine, sql);
+    int64_t count = result.row_count;
+    result_free(&result);
+    return count;
+}
+
+static void check_cell_str(const Result *result, int64_t row, int col, const char *expected)
+{
+    size_t len = 0;
+    const char *text = result_get_str(result, row, col, &len);
+    CHECK(len == strlen(expected));
+    CHECK(memcmp(text, expected, len) == 0);
+}
+
+/* 결과의 name 열(col)이 names 와 순서대로 같은지 */
+static void check_names(Engine *engine, const char *sql, int col, const char *const *names,
+                        int count)
+{
+    Result result = select_ok(engine, sql);
+    CHECK(result.row_count == count);
+    for (int i = 0; i < count; i++)
+        check_cell_str(&result, i, col, names[i]);
+    result_free(&result);
+}
+
+/* T15-01 */ static void test_select_all(void)
+{
+    TestDb db = open_people();
+    Result result = select_ok(db.engine, "SELECT * FROM users");
+    CHECK(result.row_count == 3);
+    CHECK(result.column_count == 3);
+    CHECK_STR_EQ(result.columns[0].name, "id");
+    CHECK_STR_EQ(result.columns[1].name, "name");
+    CHECK_STR_EQ(result.columns[2].name, "age");
+    for (int i = 0; i < 3; i++)
+        CHECK(result_get_int(&result, i, 0) == i + 1);
+    check_cell_str(&result, 2, 1, "park");
+    CHECK(result_get_int(&result, 2, 2) == 22);
+    CHECK(result.affected_rows == 0);
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* T15-02 */ static void test_select_columns_in_order(void)
+{
+    TestDb db = open_people();
+    Result result = select_ok(db.engine, "SELECT age, name FROM users");
+    CHECK(result.column_count == 2);
+    CHECK_STR_EQ(result.columns[0].name, "age");
+    CHECK(result.columns[0].type == COL_INT);
+    CHECK_STR_EQ(result.columns[1].name, "name");
+    CHECK(result.columns[1].type == COL_VARCHAR);
+    CHECK(result.columns[1].size == 8);
+    CHECK(result_get_int(&result, 1, 0) == 30);
+    check_cell_str(&result, 1, 1, "lee");
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* T15-03, T15-04, T15-06 */ static void test_select_where(void)
+{
+    TestDb db = open_people();
+    const char *lee[] = { "lee" };
+    check_names(db.engine, "SELECT * FROM users WHERE id = 2", USERS_NAME_COLUMN, lee, 1);
+    const char *over_24[] = { "kim", "lee" };
+    check_names(db.engine, "SELECT * FROM users WHERE age > 24", USERS_NAME_COLUMN, over_24, 2);
+    const char *park[] = { "park" };
+    check_names(db.engine, "SELECT name FROM users WHERE name = 'park'", 0, park, 1);
+    test_db_destroy(&db);
+}
+
+/* T15-05, E15-11 */ static void test_select_all_operators(void)
+{
+    TestDb db = open_people(); /* age: 25, 30, 22 */
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age = 25") == 1);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age != 25") == 2);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age < 25") == 1);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age > 25") == 1);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age <= 25") == 2);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age >= 25") == 2);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE id != 2") == 2);
+    test_db_destroy(&db);
+}
+
+/* T15-07, E15-03, E15-04 */ static void test_select_limit(void)
+{
+    TestDb db = open_people();
+    const char *first_two[] = { "kim", "lee" };
+    check_names(db.engine, "SELECT * FROM users LIMIT 2", USERS_NAME_COLUMN, first_two, 2);
+    CHECK(select_count(db.engine, "SELECT * FROM users LIMIT 0") == 0);
+    CHECK(select_count(db.engine, "SELECT * FROM users LIMIT 100") == 3);
+    const char *young[] = { "kim" };
+    check_names(db.engine, "SELECT * FROM users WHERE age < 30 LIMIT 1", USERS_NAME_COLUMN,
+                young, 1);
+    test_db_destroy(&db);
+}
+
+/* E15-01 */ static void test_select_empty_table(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    Result result = select_ok(db.engine, "SELECT name FROM users");
+    CHECK(result.row_count == 0);
+    CHECK(result.column_count == 1);
+    CHECK_STR_EQ(result.columns[0].name, "name");
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* E15-02, E15-05 */ static void test_select_no_match(void)
+{
+    TestDb db = open_people();
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age > 100") == 0);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE name = 'KIM'") == 0);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE name = 'kimchi_long'") == 0);
+    test_db_destroy(&db);
+}
+
+/* E15-06, E15-07 */ static void test_select_string_compare(void)
+{
+    TestDb db = open_db("CREATE TABLE words (id INT, w VARCHAR(4));");
+    insert_ok(db.engine, "INSERT INTO words VALUES ('ab')");
+    insert_ok(db.engine, "INSERT INTO words VALUES ('abcd')");
+    insert_ok(db.engine, "INSERT INTO words VALUES ('b')");
+    CHECK(select_count(db.engine, "SELECT * FROM words WHERE w < 'abc'") == 1);   /* ab */
+    CHECK(select_count(db.engine, "SELECT * FROM words WHERE w > 'abc'") == 2);   /* abcd, b */
+    CHECK(select_count(db.engine, "SELECT * FROM words WHERE w = 'abcd'") == 1);  /* 꽉 찬 칸 */
+    CHECK(select_count(db.engine, "SELECT * FROM words WHERE w = 'abc'") == 0);
+    CHECK(select_count(db.engine, "SELECT * FROM words WHERE w >= 'ab'") == 3);
+    CHECK(select_count(db.engine, "SELECT * FROM words WHERE w < ''") == 0);
+    test_db_destroy(&db);
+}
+
+/* E15-08 */ static void test_select_negative(void)
+{
+    TestDb db = open_people();
+    insert_ok(db.engine, "INSERT INTO users VALUES ('neg', -1)");
+    const char *neg[] = { "neg" };
+    check_names(db.engine, "SELECT * FROM users WHERE age < 0", USERS_NAME_COLUMN, neg, 1);
+    test_db_destroy(&db);
+}
+
+static void insert_many(Engine *engine, int count)
+{
+    for (int i = 0; i < count; i++) {
+        char sql[INSERT_SQL_MAX];
+        snprintf(sql, sizeof(sql), "INSERT INTO users VALUES ('u%d', %d)", i, i);
+        insert_ok(engine, sql);
+    }
+}
+
+/* E15-09 */ static void test_select_across_batch_boundary(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    insert_many(db.engine, BATCH_EDGE_ROWS);
+    Result result = select_ok(db.engine, "SELECT * FROM users");
+    CHECK(result.row_count == BATCH_EDGE_ROWS);
+    for (int i = 0; i < BATCH_EDGE_ROWS; i++)
+        CHECK(result_get_int(&result, i, 0) == i + 1);
+    result_free(&result);
+    result = select_ok(db.engine, "SELECT * FROM users WHERE id = 257");
+    CHECK(result.row_count == 1);
+    check_cell_str(&result, 0, USERS_NAME_COLUMN, "u256");
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* E15-10 */ static void test_select_same_column_twice(void)
+{
+    TestDb db = open_people();
+    Result result = select_ok(db.engine, "SELECT name, name FROM users WHERE id = 1");
+    CHECK(result.column_count == 2);
+    check_cell_str(&result, 0, 0, "kim");
+    check_cell_str(&result, 0, 1, "kim");
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* E15-12 */ static void test_select_many_rows(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    insert_many(db.engine, MANY_ROWS);
+    Result result = select_ok(db.engine, "SELECT * FROM users");
+    CHECK(result.row_count == MANY_ROWS);
+    CHECK(result_get_int(&result, MANY_ROWS - 1, 0) == MANY_ROWS);
+    CHECK(result_get_int(&result, MANY_ROWS - 1, 2) == MANY_ROWS - 1);
+    result_free(&result);
+    CHECK(select_count(db.engine, "SELECT * FROM users WHERE age >= 5000") == MANY_ROWS / 2);
+    test_db_destroy(&db);
+}
+
+static void test_select_persists_after_reopen(void)
+{
+    TestDb db = open_people();
+    test_db_reopen(&db);
+    CHECK(db.engine != NULL);
+    CHECK(select_count(db.engine, "SELECT * FROM users") == 3);
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     RUN(test_open_two_tables);
@@ -228,6 +454,19 @@ int main(void)
     RUN(test_execute_rejects_create_and_params);
     RUN(test_table_name_from_upper_case_file);
     RUN(test_close_null_is_safe);
+    RUN(test_select_all);
+    RUN(test_select_columns_in_order);
+    RUN(test_select_where);
+    RUN(test_select_all_operators);
+    RUN(test_select_limit);
+    RUN(test_select_empty_table);
+    RUN(test_select_no_match);
+    RUN(test_select_string_compare);
+    RUN(test_select_negative);
+    RUN(test_select_across_batch_boundary);
+    RUN(test_select_same_column_twice);
+    RUN(test_select_many_rows);
+    RUN(test_select_persists_after_reopen);
     TEST_DONE();
     return 0;
 }
