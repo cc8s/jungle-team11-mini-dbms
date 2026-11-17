@@ -43,4 +43,7 @@ void server_stop(Server *server);
 /* server_run 이 돌아온 뒤 (또는 돌리지 않았으면 바로) 자원을 해제한다. NULL 이면 아무 일도 없다 */
 void server_destroy(Server *server);
 
+/* 엔진 에러 코드 → HTTP 상태 코드 (계획서 5.3). 모든 ErrorCode 가 표에 있다. 표 밖 값은 500 */
+int server_status_for_error(ErrorCode code);
+
 #endif

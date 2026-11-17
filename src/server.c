@@ -109,12 +109,82 @@ static void handle_health(Server *server, int fd, const HttpRequest *request)
     send_json(fd, HTTP_STATUS_OK, HEALTH_BODY, strlen(HEALTH_BODY), NULL);
 }
 
-/* S37 에서 엔진과 연결한다. 그전까지 경로만 등록해 두어 405 판정 (GET /query) 이 맞게 한다 */
+/* ---- /query ---- */
+
+typedef struct {
+    ErrorCode code;
+    int status;
+} ErrorStatus;
+
+/* 엔진 에러 → HTTP 상태 (계획서 5.3). 요청이 잘못된 것은 400, 없는 테이블은 404, 너무 큰 것은 413,
+ * 서버 쪽 문제 (파일, 손상, 메모리) 는 500. 빠진 코드가 없는지 E37-01 이 모든 코드를 순회해 확인한다 */
+static const ErrorStatus ERROR_STATUSES[] = {
+    {ERR_NONE, HTTP_STATUS_OK},
+    {ERR_SYNTAX, HTTP_STATUS_BAD_REQUEST},
+    {ERR_UNKNOWN_TABLE, HTTP_STATUS_NOT_FOUND},
+    {ERR_UNKNOWN_COLUMN, HTTP_STATUS_BAD_REQUEST},
+    {ERR_TYPE_MISMATCH, HTTP_STATUS_BAD_REQUEST},
+    {ERR_VALUE_COUNT, HTTP_STATUS_BAD_REQUEST},
+    {ERR_VALUE_TOO_LONG, HTTP_STATUS_BAD_REQUEST},
+    {ERR_OUT_OF_RANGE, HTTP_STATUS_BAD_REQUEST},
+    {ERR_AUTO_ID, HTTP_STATUS_BAD_REQUEST},
+    {ERR_UNSUPPORTED, HTTP_STATUS_BAD_REQUEST},
+    {ERR_PARAM, HTTP_STATUS_BAD_REQUEST},
+    {ERR_TOO_LARGE, HTTP_STATUS_PAYLOAD_TOO_LARGE},
+    {ERR_IO, HTTP_STATUS_INTERNAL_ERROR},
+    {ERR_CORRUPT, HTTP_STATUS_INTERNAL_ERROR},
+    {ERR_INTERNAL, HTTP_STATUS_INTERNAL_ERROR},
+};
+
+int server_status_for_error(ErrorCode code)
+{
+    for (size_t i = 0; i < sizeof(ERROR_STATUSES) / sizeof(ERROR_STATUSES[0]); i++) {
+        if (ERROR_STATUSES[i].code == code)
+            return ERROR_STATUSES[i].status;
+    }
+    return HTTP_STATUS_INTERNAL_ERROR;
+}
+
+/* JSON 요청 파싱 실패를 응답으로. params 오류는 엔진의 ERR_PARAM 과 같은 코드 이름 ("PARAM") 을 쓴다 */
+static void send_json_error(int fd, JsonStatus status, const char *message)
+{
+    if (status == JSON_BAD_PARAM) {
+        Result result = result_error(ERR_PARAM, 0, "%s", message);
+        JsonBuf buf;
+        json_buf_init(&buf);
+        if (json_write_result(&result, 0, &buf) == ERR_NONE)
+            send_json(fd, HTTP_STATUS_BAD_REQUEST, buf.data, buf.len, NULL);
+        else
+            send_json(fd, HTTP_STATUS_INTERNAL_ERROR, NULL, 0, NULL);
+        json_buf_free(&buf);
+        return;
+    }
+    int http_status =
+        status == JSON_NO_MEMORY ? HTTP_STATUS_INTERNAL_ERROR : HTTP_STATUS_BAD_REQUEST;
+    send_http_error(fd, http_status, message, NULL);
+}
+
+/* 본문 JSON → engine_execute (실행 단계만 엔진 락 안) → Result → JSON 응답.
+ * JSON 파싱과 응답 만들기는 락 밖이라 다른 워커의 실행을 막지 않는다 */
 static void handle_query(Server *server, int fd, const HttpRequest *request)
 {
-    (void)server;
-    (void)request;
-    send_http_error(fd, HTTP_STATUS_NOT_IMPLEMENTED, "/query is not available yet", NULL);
+    QueryRequest query;
+    char message[MAX_MESSAGE];
+    JsonStatus status = json_parse_query(request->body, request->body_len, &query, message);
+    if (status != JSON_OK) {
+        send_json_error(fd, status, message);
+        return;
+    }
+    Result result = engine_execute(server->engine, query.sql, query.params, query.param_count);
+    query_request_free(&query);
+    JsonBuf buf;
+    json_buf_init(&buf);
+    if (json_write_result(&result, server->options.max_rows, &buf) == ERR_NONE)
+        send_json(fd, server_status_for_error(result.error), buf.data, buf.len, NULL);
+    else
+        send_http_error(fd, HTTP_STATUS_INTERNAL_ERROR, "out of memory", NULL);
+    json_buf_free(&buf);
+    result_free(&result);
 }
 
 /* 라우팅 표. 경로·메서드 조합은 여기에만 둔다 */

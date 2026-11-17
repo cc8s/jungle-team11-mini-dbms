@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -11,6 +12,7 @@
 
 #include "cli.h"
 #include "server.h"
+#include "table_internal.h"
 
 #define LOCALHOST "127.0.0.1"
 #define RESPONSE_CAPACITY 65536
@@ -34,15 +36,23 @@ static void *run_server(void *arg)
     return NULL;
 }
 
-static void start_server_with(TestServer *ts, const ServerOptions *options)
+#define USERS_SQL "CREATE TABLE users (id INT, name VARCHAR(32), age INT);"
+
+/* create_sql 의 테이블들을 만든 데이터 디렉터리로 서버를 띄운다 (NULL 이면 테이블 없음) */
+static void start_server_on(TestServer *ts, const ServerOptions *options, const char *create_sql)
 {
-    ts->db = test_db_create(NULL);
+    ts->db = test_db_create(create_sql);
     CHECK(ts->db.engine != NULL);
     char message[MAX_MESSAGE];
     ts->server = server_create(ts->db.engine, options, message);
     CHECK(ts->server != NULL);
     ts->port = server_port(ts->server);
     CHECK(pthread_create(&ts->thread, NULL, run_server, ts) == 0);
+}
+
+static void start_server_with(TestServer *ts, const ServerOptions *options)
+{
+    start_server_on(ts, options, NULL);
 }
 
 static void start_server(TestServer *ts)
@@ -304,6 +314,225 @@ static void test_serve_usage_errors(void)
     }
 }
 
+/* ---- S37 /query ---- */
+
+#define CONCURRENT_CLIENTS 8
+#define INSERTS_PER_CLIENT 100
+#define BIG_SQL_LEN 70000
+#define REQUEST_HEAD_SIZE 256
+
+static void start_users_server(TestServer *ts)
+{
+    ServerOptions options = server_default_options();
+    start_server_on(ts, &options, USERS_SQL);
+}
+
+/* POST /query 에 body 를 보낸다 */
+static void post_query(int port, const char *body, Response *out)
+{
+    size_t body_len = strlen(body);
+    char head[REQUEST_HEAD_SIZE];
+    int head_len = snprintf(head, sizeof(head),
+                            "POST /query HTTP/1.1\r\nContent-Type: application/json\r\n"
+                            "Content-Length: %zu\r\n\r\n",
+                            body_len);
+    int fd = connect_to(port);
+    CHECK(write(fd, head, (size_t)head_len) == head_len);
+    CHECK(write(fd, body, body_len) == (ssize_t)body_len);
+    read_response(fd, out);
+    close(fd);
+}
+
+static int32_t insert_id_of(const Response *response)
+{
+    const char *field = strstr(response->body, "\"last_insert_id\":");
+    CHECK(field != NULL);
+    int id = 0;
+    CHECK(sscanf(field, "\"last_insert_id\":%d", &id) == 1);
+    return id;
+}
+
+/* T37-01 */
+static void test_query_insert(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Response response;
+    post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES ('kim', 25)\"}", &response);
+    CHECK(response.status == 200);
+    CHECK(strstr(response.body, "{\"ok\":true,\"affected_rows\":1,\"last_insert_id\":1,") ==
+          response.body);
+    stop_server(&ts);
+}
+
+/* T37-02, T37-03 */
+static void test_query_select_after_insert(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Response response;
+    post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES ('kim', 25)\"}", &response);
+    post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES ('lee', 30)\"}", &response);
+    post_query(ts.port, "{\"sql\":\"SELECT * FROM users WHERE id = 1\"}", &response);
+    CHECK(response.status == 200);
+    CHECK(strstr(response.body, "\"rows\":[[1,\"kim\",25]],\"row_count\":1") != NULL);
+    CHECK(strstr(response.body, "\"used_index\":true") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT name FROM users WHERE age > 20\"}", &response);
+    CHECK(strstr(response.body, "\"rows\":[[\"kim\"],[\"lee\"]]") != NULL);
+    CHECK(strstr(response.body, "\"used_index\":false") != NULL);
+    stop_server(&ts);
+}
+
+/* T37-04, T37-05, E37-02 */
+static void test_query_engine_errors(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Response response;
+    post_query(ts.port, "{\"sql\":\"SELEC * FROM users\"}", &response);
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"SYNTAX\"") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT * FROM nope\"}", &response);
+    CHECK(response.status == 404);
+    CHECK(strstr(response.body, "\"code\":\"UNKNOWN_TABLE\"") != NULL);
+    post_query(ts.port, "{\"sql\":\"\"}", &response); /* E37-02 */
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"SYNTAX\"") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT nmae FROM users\"}", &response);
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"UNKNOWN_COLUMN\"") != NULL);
+    stop_server(&ts);
+}
+
+/* JSON 계층 에러: 깨진 JSON 은 BAD_REQUEST, 잘못된 params 는 PARAM (둘 다 400) */
+static void test_query_json_errors(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Response response;
+    post_query(ts.port, "{\"sql\":", &response);
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"BAD_REQUEST\"") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT * FROM users\",\"params\":[1.5]}", &response);
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"PARAM\"") != NULL);
+    stop_server(&ts);
+}
+
+/* E37-01 */
+static void test_error_status_table(void)
+{
+    const int expected[] = {
+        [ERR_NONE] = 200,         [ERR_SYNTAX] = 400,         [ERR_UNKNOWN_TABLE] = 404,
+        [ERR_UNKNOWN_COLUMN] = 400, [ERR_TYPE_MISMATCH] = 400, [ERR_VALUE_COUNT] = 400,
+        [ERR_VALUE_TOO_LONG] = 400, [ERR_OUT_OF_RANGE] = 400,  [ERR_AUTO_ID] = 400,
+        [ERR_UNSUPPORTED] = 400,  [ERR_PARAM] = 400,          [ERR_TOO_LARGE] = 413,
+        [ERR_IO] = 500,           [ERR_CORRUPT] = 500,        [ERR_INTERNAL] = 500,
+    };
+    _Static_assert(sizeof(expected) / sizeof(expected[0]) == ERR_INTERNAL + 1,
+                   "every ErrorCode needs an expected status");
+    for (int code = ERR_NONE; code <= ERR_INTERNAL; code++)
+        CHECK(server_status_for_error((ErrorCode)code) == expected[code]);
+    CHECK(server_status_for_error((ErrorCode)(ERR_INTERNAL + 1)) == 500);
+}
+
+/* E37-03: SQL 이 64KB 를 넘으면 본문도 넘으므로 본문을 받기 전에 413 */
+static void test_query_too_large(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    char *body = malloc(BIG_SQL_LEN + 32);
+    CHECK(body != NULL);
+    int prefix = snprintf(body, 32, "{\"sql\":\"");
+    memset(body + prefix, 'x', BIG_SQL_LEN);
+    strcpy(body + prefix + BIG_SQL_LEN, "\"}");
+    Response response;
+    post_query(ts.port, body, &response);
+    CHECK(response.status == 413);
+    CHECK(strstr(response.body, "\"code\":\"PAYLOAD_TOO_LARGE\"") != NULL);
+    free(body);
+    stop_server(&ts);
+}
+
+/* E37-04: 테이블 fd 를 읽기 전용으로 바꿔 pwrite 실패 (ERR_IO) 를 만든다.
+ * (파일 권한을 바꿔도 이미 열린 fd 는 계속 쓸 수 있어서 fd 를 바꾼다) */
+static void test_query_io_error(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Table *table = (Table *)engine_find_table(ts.db.engine, "users");
+    CHECK(table != NULL);
+    char path[TEST_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/users.tbl", ts.db.dir);
+    int writable_fd = table->fd;
+    table->fd = open(path, O_RDONLY); /* 아직 요청이 없어 워커가 테이블을 쓰지 않는다 */
+    CHECK(table->fd >= 0);
+
+    Response response;
+    post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES ('kim', 25)\"}", &response);
+    CHECK(response.status == 500);
+    CHECK(strstr(response.body, "\"code\":\"IO\"") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT * FROM users\"}", &response); /* 서버는 계속 동작 */
+    CHECK(response.status == 200);
+    CHECK(strstr(response.body, "\"row_count\":0") != NULL);
+
+    server_stop(ts.server); /* 워커가 모두 끝난 뒤, 엔진을 닫기 전에 fd 를 되돌린다 */
+    CHECK(pthread_join(ts.thread, NULL) == 0);
+    server_destroy(ts.server);
+    close(table->fd);
+    table->fd = writable_fd;
+    test_db_destroy(&ts.db);
+}
+
+typedef struct {
+    int port;
+    int32_t ids[INSERTS_PER_CLIENT];
+} InsertClient;
+
+static void *insert_many(void *arg)
+{
+    InsertClient *client = arg;
+    for (int i = 0; i < INSERTS_PER_CLIENT; i++) {
+        Response *response = malloc(sizeof(*response));
+        CHECK(response != NULL);
+        post_query(client->port, "{\"sql\":\"INSERT INTO users VALUES ('t', 1)\"}", response);
+        CHECK(response->status == 200);
+        client->ids[i] = insert_id_of(response);
+        free(response);
+    }
+    return NULL;
+}
+
+/* E37-05 */
+static void test_concurrent_inserts(void)
+{
+    ServerOptions options = server_default_options();
+    options.worker_count = CONCURRENT_CLIENTS;
+    TestServer ts;
+    start_server_on(&ts, &options, USERS_SQL);
+    pthread_t threads[CONCURRENT_CLIENTS];
+    InsertClient *clients = calloc(CONCURRENT_CLIENTS, sizeof(*clients));
+    CHECK(clients != NULL);
+    for (int t = 0; t < CONCURRENT_CLIENTS; t++) {
+        clients[t].port = ts.port;
+        CHECK(pthread_create(&threads[t], NULL, insert_many, &clients[t]) == 0);
+    }
+    bool seen[CONCURRENT_CLIENTS * INSERTS_PER_CLIENT + 1] = {false};
+    for (int t = 0; t < CONCURRENT_CLIENTS; t++) {
+        CHECK(pthread_join(threads[t], NULL) == 0);
+        for (int i = 0; i < INSERTS_PER_CLIENT; i++) {
+            int32_t id = clients[t].ids[i];
+            CHECK(id >= 1 && id <= CONCURRENT_CLIENTS * INSERTS_PER_CLIENT && !seen[id]);
+            seen[id] = true; /* 800 개가 모두 다르고 범위 안 = 1..800 중복·누락 없음 */
+        }
+    }
+    free(clients);
+    Response response;
+    post_query(ts.port, "{\"sql\":\"SELECT id FROM users WHERE id >= 800\"}", &response);
+    CHECK(strstr(response.body, "\"rows\":[[800]],\"row_count\":1") != NULL);
+    stop_server(&ts);
+}
+
 int main(void)
 {
     printf("test_server\n");
@@ -318,6 +547,14 @@ int main(void)
     RUN(test_quick_disconnects);
     RUN(test_invalid_options);
     RUN(test_serve_usage_errors);
+    RUN(test_query_insert);
+    RUN(test_query_select_after_insert);
+    RUN(test_query_engine_errors);
+    RUN(test_query_json_errors);
+    RUN(test_error_status_table);
+    RUN(test_query_too_large);
+    RUN(test_query_io_error);
+    RUN(test_concurrent_inserts);
     TEST_DONE();
     return 0;
 }

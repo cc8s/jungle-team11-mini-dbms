@@ -27,7 +27,10 @@ const char *engine_warning(const Engine *engine, int index);
 /* 이름이 name 인 테이블 (인덱스·재구축 시간 조회, 테스트·벤치마크용). 없으면 NULL */
 const Table *engine_find_table(const Engine *engine, const char *name);
 
-/* sql 한 문장을 실행한다 (단일 문장 모드: 두 번째 문장은 ERR_UNSUPPORTED, 빈 입력은 ERR_SYNTAX).
+/* 여러 스레드가 같은 엔진으로 engine_execute 를 동시에 불러도 된다 (테이블을 읽고 쓰는 실행 단계는
+ * 엔진 안의 락이 감싼다). engine_open / engine_close 는 서버 시작 전·종료 후 한 스레드에서만 부른다.
+ *
+ * sql 한 문장을 실행한다 (단일 문장 모드: 두 번째 문장은 ERR_UNSUPPORTED, 빈 입력은 ERR_SYNTAX).
  * 결과는 호출한 쪽이 result_free 한다. params 는 Phase 3 바인딩용 (지금은 param_count = 0 만). */
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count);
 

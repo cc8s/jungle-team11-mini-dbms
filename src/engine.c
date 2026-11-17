@@ -1,6 +1,7 @@
 #include "engine.h"
 
 #include <dirent.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,10 @@ struct Engine {
     int table_capacity;
     char (*warnings)[MAX_MESSAGE]; /* 열 때 생긴 경고 (헤더 복구). 테이블마다 최대 1 개 */
     int warning_count;
+    /* 실행 단계 (executor_run) 를 감싸는 뮤텍스 하나 (LOCK_MODE GLOBAL). 테이블 파일·헤더·인덱스를
+     * 여러 워커가 동시에 바꾸지 못하게 한다. 전역 변수가 아니라 엔진마다 하나다 */
+    pthread_mutex_t execute_mutex;
+    bool has_execute_mutex;
 };
 
 /* ---- 열기 ---- */
@@ -134,6 +139,11 @@ Engine *engine_open(const char *data_dir, ErrorCode *out_error, char out_message
         open_failure(ERR_INTERNAL, out_error, out_message, "out of memory");
         return NULL;
     }
+    engine->has_execute_mutex = pthread_mutex_init(&engine->execute_mutex, NULL) == 0;
+    if (!engine->has_execute_mutex) {
+        open_failure(ERR_INTERNAL, out_error, out_message, "cannot create the engine lock");
+        goto cleanup;
+    }
     DIR *dir = opendir(data_dir);
     if (dir == NULL) {
         open_failure(ERR_IO, out_error, out_message, "cannot open data directory '%s'", data_dir);
@@ -157,6 +167,8 @@ void engine_close(Engine *engine)
         table_close(engine->tables[i]);
     free(engine->tables);
     free(engine->warnings);
+    if (engine->has_execute_mutex)
+        pthread_mutex_destroy(&engine->execute_mutex);
     free(engine);
 }
 
@@ -185,7 +197,10 @@ static double elapsed_ms_since(const struct timespec *start)
            (double)(end.tv_nsec - start->tv_nsec) / NS_PER_MS;
 }
 
-/* 파싱된 문장 하나를 검증하고 실행한다. 검증에서 실패하면 테이블을 건드리지 않는다 */
+/* 파싱된 문장 하나를 검증하고 실행한다. 검증에서 실패하면 테이블을 건드리지 않고 락도 잡지 않는다.
+ * 락 범위는 executor_run 하나: 검증은 열린 뒤 바뀌지 않는 스키마만 읽고, 파싱·결과 변환 (JSON) 은
+ * 호출한 쪽이 락 밖에서 한다. INSERT 의 "id 발급 → 레코드 → 헤더 → 트리" 와 SELECT 의
+ * "row_count 읽기 → 레코드 복사" 가 각각 한 덩어리로 보이게 된다. */
 static Result execute_statement(Engine *engine, const Statement *stmt)
 {
     Plan plan;
@@ -193,7 +208,10 @@ static Result execute_statement(Engine *engine, const Statement *stmt)
     ErrorCode error = validator_check(stmt, engine->tables, engine->table_count, &plan, message);
     if (error != ERR_NONE)
         return result_error(error, stmt->line, "%s", message);
-    return executor_run(stmt, &plan);
+    pthread_mutex_lock(&engine->execute_mutex);
+    Result result = executor_run(stmt, &plan);
+    pthread_mutex_unlock(&engine->execute_mutex);
+    return result;
 }
 
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count)
