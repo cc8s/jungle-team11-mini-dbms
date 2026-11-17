@@ -18,6 +18,9 @@ ASAN_TESTS    := $(patsubst tests/%.c, $(ASAN_DIR)/tests/%, $(TEST_SRCS))
 
 .PHONY: all test test-asan run clean
 
+# 테스트 링크에만 쓰이는 오브젝트를 make 가 중간 파일로 보고 지우지 않게 한다 (매번 다시 빌드 방지)
+.SECONDARY: $(LIB_OBJS) $(ASAN_LIB_OBJS)
+
 all: $(BIN)
 
 $(BIN): build/main.o $(LIB_OBJS)
