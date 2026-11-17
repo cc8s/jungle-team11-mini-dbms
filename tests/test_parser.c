@@ -441,6 +441,135 @@ static void test_insert_extra_token_after_values(void)
     CHECK(parse_error("INSERT INTO t VALUES (1) 2") == ERR_SYNTAX);
 }
 
+/* ---- S08: CREATE TABLE ---- */
+
+static Statement parse_create_ok(const char *sql)
+{
+    Statement stmt;
+    CHECK(parse_one(sql, &stmt) == ERR_NONE);
+    CHECK(stmt.type == STMT_CREATE);
+    return stmt;
+}
+
+static void check_column_def(const ColumnDef *column, const char *name, ColumnType type,
+                             int size)
+{
+    CHECK_STR_EQ(column->name, name);
+    CHECK(column->type == type);
+    CHECK(column->size == size);
+}
+
+/* T08-01 */ static void test_create_basic(void)
+{
+    Statement stmt = parse_create_ok("CREATE TABLE users (id INT, name VARCHAR(32), age INT);");
+    CHECK_STR_EQ(stmt.create.table, "users");
+    CHECK(stmt.create.column_count == 3);
+    check_column_def(&stmt.create.columns[0], "id", COL_INT, 4);
+    check_column_def(&stmt.create.columns[1], "name", COL_VARCHAR, 32);
+    check_column_def(&stmt.create.columns[2], "age", COL_INT, 4);
+    CHECK(stmt.line == 1);
+    statement_free(&stmt);
+}
+
+/* T08-02 */ static void test_create_only_id(void)
+{
+    Statement stmt = parse_create_ok("CREATE TABLE t (id INT)");
+    CHECK(stmt.create.column_count == 1);
+    check_column_def(&stmt.create.columns[0], "id", COL_INT, 4);
+    statement_free(&stmt);
+}
+
+/* T08-03 */ static void test_create_names_are_lowercased(void)
+{
+    Statement stmt = parse_create_ok("create table T (ID int, Name varchar(8))");
+    CHECK_STR_EQ(stmt.create.table, "t");
+    check_column_def(&stmt.create.columns[0], "id", COL_INT, 4);
+    check_column_def(&stmt.create.columns[1], "name", COL_VARCHAR, 8);
+    statement_free(&stmt);
+}
+
+static void test_create_max_columns(void)
+{
+    Statement stmt = parse_create_ok("CREATE TABLE t (id INT, c1 INT, c2 INT, c3 INT, c4 INT,"
+                                     " c5 INT, c6 INT, c7 INT, c8 INT, c9 INT, c10 INT,"
+                                     " c11 INT, c12 INT, c13 INT, c14 INT, c15 VARCHAR(2))");
+    CHECK(stmt.create.column_count == MAX_COLUMNS);
+    check_column_def(&stmt.create.columns[MAX_COLUMNS - 1], "c15", COL_VARCHAR, 2);
+    statement_free(&stmt);
+}
+
+/* E08-01 */ static void test_create_first_column_not_id(void)
+{
+    CHECK(parse_error("CREATE TABLE t (name VARCHAR(8), id INT)") == ERR_UNSUPPORTED);
+}
+
+/* E08-02 */ static void test_create_id_not_int(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id VARCHAR(8))") == ERR_UNSUPPORTED);
+}
+
+/* E08-03 */ static void test_create_without_columns(void)
+{
+    CHECK(parse_error("CREATE TABLE t ()") == ERR_SYNTAX);
+    CHECK(parse_error("CREATE TABLE t") == ERR_SYNTAX);
+}
+
+/* E08-04 */ static void test_create_too_many_columns(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT,"
+                      " c6 INT, c7 INT, c8 INT, c9 INT, c10 INT, c11 INT, c12 INT,"
+                      " c13 INT, c14 INT, c15 INT, c16 INT)") == ERR_UNSUPPORTED);
+}
+
+/* E08-05 */ static void test_create_duplicate_column(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT, a INT, A INT)") == ERR_SYNTAX);
+    CHECK(parse_error("CREATE TABLE t (id INT, ID INT)") == ERR_SYNTAX);
+}
+
+/* E08-06 */ static void test_create_varchar_without_size(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR)") == ERR_SYNTAX);
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR())") == ERR_SYNTAX);
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR(8)") == ERR_SYNTAX);
+}
+
+/* E08-07 */ static void test_create_varchar_zero(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR(0))") == ERR_OUT_OF_RANGE);
+}
+
+/* E08-08 */ static void test_create_varchar_limit(void)
+{
+    Statement stmt = parse_create_ok("CREATE TABLE t (id INT, a VARCHAR(1024))");
+    check_column_def(&stmt.create.columns[1], "a", COL_VARCHAR, MAX_VARCHAR);
+    statement_free(&stmt);
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR(1025))") == ERR_OUT_OF_RANGE);
+}
+
+/* E08-09 */ static void test_create_varchar_negative(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR(-1))") == ERR_SYNTAX);
+    CHECK(parse_error("CREATE TABLE t (id INT, a VARCHAR('8'))") == ERR_SYNTAX);
+}
+
+/* E08-10 */ static void test_create_unsupported_type(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT, f FLOAT)") == ERR_UNSUPPORTED);
+    CHECK(parse_error("CREATE TABLE t (id INT, f)") == ERR_SYNTAX);
+}
+
+/* E08-11 */ static void test_create_without_table_keyword(void)
+{
+    CHECK(parse_error("CREATE users (id INT)") == ERR_SYNTAX);
+}
+
+static void test_create_extra_token_after_columns(void)
+{
+    CHECK(parse_error("CREATE TABLE t (id INT) x") == ERR_SYNTAX);
+    CHECK(parse_error("CREATE TABLE t (id INT, select INT)") == ERR_SYNTAX);
+}
+
 int main(void)
 {
     RUN(test_select_all);
@@ -499,6 +628,22 @@ int main(void)
     RUN(test_insert_multiple_rows);
     RUN(test_insert_column_list);
     RUN(test_insert_extra_token_after_values);
+    RUN(test_create_basic);
+    RUN(test_create_only_id);
+    RUN(test_create_names_are_lowercased);
+    RUN(test_create_max_columns);
+    RUN(test_create_first_column_not_id);
+    RUN(test_create_id_not_int);
+    RUN(test_create_without_columns);
+    RUN(test_create_too_many_columns);
+    RUN(test_create_duplicate_column);
+    RUN(test_create_varchar_without_size);
+    RUN(test_create_varchar_zero);
+    RUN(test_create_varchar_limit);
+    RUN(test_create_varchar_negative);
+    RUN(test_create_unsupported_type);
+    RUN(test_create_without_table_keyword);
+    RUN(test_create_extra_token_after_columns);
     TEST_DONE();
     return 0;
 }

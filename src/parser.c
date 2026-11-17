@@ -11,6 +11,8 @@
 #define INITIAL_TOKEN_CAPACITY 16
 #define MAX_SHOWN_TOKEN_LEN 32            /* 메시지에 보여줄 토큰 원문 최대 길이 */
 #define MAX_DETAIL_LEN (MAX_MESSAGE / 2)  /* "near '...': " 뒤에 붙는 설명 */
+#define ID_COLUMN_NAME "id"                /* 모든 테이블의 첫 컬럼 (자동 부여) */
+#define INT_COLUMN_SIZE ((int)sizeof(int32_t))
 
 /* 파서는 문장 하나의 토큰을 ; (또는 입력 끝) 까지 먼저 배열로 모은 뒤 그 배열을 재귀 하강으로 읽는다.
  * 이렇게 하면 1) 미리 보기가 배열 인덱스로 단순해지고, 2) 문법 에러가 나도 이미 ; 까지 읽었으므로
@@ -425,6 +427,112 @@ static ErrorCode parse_insert(Parser *parser, Statement *stmt)
     return error;
 }
 
+/* ---- CREATE TABLE ---- */
+
+/* VARCHAR 뒤의 ( n ). 음수는 토크나이저가 INT(-1) 로 주므로 문법 오류로,
+ * 0 과 MAX_VARCHAR 초과는 형식은 맞지만 범위를 벗어난 값이라 ERR_OUT_OF_RANGE 로 나눈다 */
+static ErrorCode parse_varchar_size(Parser *parser, ColumnDef *column)
+{
+    if (!match(parser, TOK_LPAREN))
+        return fail_at(parser, ERR_SYNTAX, current(parser),
+                       "VARCHAR needs a size like VARCHAR(32)");
+    const Token *token = current(parser);
+    if (token->type != TOK_INT || token->int_value < 0)
+        return fail_at(parser, ERR_SYNTAX, token, "VARCHAR size must be a positive integer");
+    if (token->int_value == 0 || token->int_value > MAX_VARCHAR)
+        return fail_at(parser, ERR_OUT_OF_RANGE, token, "VARCHAR size must be 1 to %d",
+                       MAX_VARCHAR);
+    column->size = token->int_value;
+    advance(parser);
+    if (!match(parser, TOK_RPAREN))
+        return fail_at(parser, ERR_SYNTAX, current(parser), "expected ')' after VARCHAR size");
+    return ERR_NONE;
+}
+
+/* INT | VARCHAR ( n ). FLOAT 같은 이름은 식별자로 읽히므로 지원 안 하는 타입으로 알려준다 */
+static ErrorCode parse_column_type(Parser *parser, ColumnDef *column)
+{
+    const Token *token = current(parser);
+    if (is_keyword(token, KW_INT)) {
+        advance(parser);
+        column->type = COL_INT;
+        column->size = INT_COLUMN_SIZE;
+        return ERR_NONE;
+    }
+    if (is_keyword(token, KW_VARCHAR)) {
+        advance(parser);
+        column->type = COL_VARCHAR;
+        return parse_varchar_size(parser, column);
+    }
+    if (token->type == TOK_IDENT)
+        return fail_at(parser, ERR_UNSUPPORTED, token, "only INT and VARCHAR(n) are supported");
+    return fail_at(parser, ERR_SYNTAX, token, "expected a column type");
+}
+
+static bool has_column(const CreateStmt *create, const char *name)
+{
+    for (int i = 0; i < create->column_count; i++) {
+        if (strcmp(create->columns[i].name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* 이름은 토크나이저가 소문자로 정규화해 두었으므로 a 와 A 는 strcmp 로 같은 이름이 된다 */
+static ErrorCode check_column_rules(Parser *parser, const CreateStmt *create,
+                                    const ColumnDef *column, const Token *name_token)
+{
+    if (has_column(create, column->name))
+        return fail_at(parser, ERR_SYNTAX, name_token, "duplicate column name");
+    bool is_first = create->column_count == 0;
+    bool is_id = strcmp(column->name, ID_COLUMN_NAME) == 0 && column->type == COL_INT;
+    if (is_first && !is_id)
+        return fail_at(parser, ERR_UNSUPPORTED, name_token,
+                       "the first column must be '%s INT'", ID_COLUMN_NAME);
+    return ERR_NONE;
+}
+
+/* ident type. 규칙 검사를 통과한 뒤에만 column_count 를 올린다 */
+static ErrorCode parse_column_def(Parser *parser, CreateStmt *create)
+{
+    if (create->column_count == MAX_COLUMNS)
+        return fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                       "a table can have at most %d columns", MAX_COLUMNS);
+    const Token *name_token = current(parser);
+    ColumnDef *column = &create->columns[create->column_count];
+    ErrorCode error = expect_identifier(parser, "column name", column->name);
+    if (error == ERR_NONE)
+        error = parse_column_type(parser, column);
+    if (error == ERR_NONE)
+        error = check_column_rules(parser, create, column, name_token);
+    if (error == ERR_NONE)
+        create->column_count++;
+    return error;
+}
+
+/* CREATE TABLE ident ( ident type (, ident type)* ).
+ * 스키마 규칙도 여기서 본다: 만들 테이블은 아직 없으니 validator 가 볼 대상이 없다 */
+static ErrorCode parse_create(Parser *parser, Statement *stmt)
+{
+    CreateStmt *create = &stmt->create;
+    advance(parser); /* CREATE */
+    ErrorCode error = expect_keyword(parser, KW_TABLE, "TABLE");
+    if (error == ERR_NONE)
+        error = expect_identifier(parser, "table name", create->table);
+    if (error == ERR_NONE && !match(parser, TOK_LPAREN))
+        error = fail_at(parser, ERR_SYNTAX, current(parser), "expected '(' and column definitions");
+    while (error == ERR_NONE) {
+        error = parse_column_def(parser, create);
+        if (error != ERR_NONE || !match(parser, TOK_COMMA))
+            break;
+    }
+    if (error == ERR_NONE && !match(parser, TOK_RPAREN))
+        error = fail_at(parser, ERR_SYNTAX, current(parser), "expected ')' or ','");
+    if (error == ERR_NONE)
+        error = expect_statement_end(parser);
+    return error;
+}
+
 /* ---- 문장 ---- */
 
 static ErrorCode parse_tokens(Parser *parser, Statement *stmt)
@@ -438,6 +546,10 @@ static ErrorCode parse_tokens(Parser *parser, Statement *stmt)
     if (is_keyword(first, KW_INSERT)) {
         stmt->type = STMT_INSERT; /* 먼저 정해 두어야 실패 시 statement_free 가 값을 해제한다 */
         return parse_insert(parser, stmt);
+    }
+    if (is_keyword(first, KW_CREATE)) {
+        stmt->type = STMT_CREATE;
+        return parse_create(parser, stmt);
     }
     if (is_unsupported_word(first))
         return fail_at(parser, ERR_UNSUPPORTED, first, "this statement is not supported");
