@@ -438,6 +438,154 @@ static void test_select_persists_after_reopen(void)
     test_db_destroy(&db);
 }
 
+/* ---- S16: 스크립트 실행 ---- */
+
+#define MAX_SCRIPT_RESULTS 16
+#define MAX_TABLE_FILE 8192
+
+/* 콜백이 받은 결과를 모아 둔다. Result 는 콜백이 끝나면 엔진이 해제하므로 필요한 값만 복사한다 */
+typedef struct {
+    int count;
+    ErrorCode errors[MAX_SCRIPT_RESULTS];
+    int indexes[MAX_SCRIPT_RESULTS];
+    int lines[MAX_SCRIPT_RESULTS];
+    int64_t row_counts[MAX_SCRIPT_RESULTS];
+    int32_t last_ids[MAX_SCRIPT_RESULTS];
+} ScriptLog;
+
+static void record_result(const Result *result, int stmt_index, void *ctx)
+{
+    ScriptLog *log = ctx;
+    CHECK(log->count < MAX_SCRIPT_RESULTS);
+    int i = log->count++;
+    log->errors[i] = result->error;
+    log->indexes[i] = stmt_index;
+    log->lines[i] = result->line;
+    log->row_counts[i] = result->row_count;
+    log->last_ids[i] = result->last_insert_id;
+    CHECK(result->elapsed_ms >= 0);
+}
+
+static ScriptLog run_script(Engine *engine, const char *script, int *out_error_count)
+{
+    ScriptLog log = { 0 };
+    *out_error_count = engine_execute_script(engine, script, record_result, &log);
+    return log;
+}
+
+static size_t read_table_file(const TestDb *db, const char *table, uint8_t *bytes)
+{
+    char path[TEST_PATH_MAX];
+    CHECK(table_build_path(db->dir, table, path, sizeof(path)));
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0);
+    ssize_t n = pread(fd, bytes, MAX_TABLE_FILE, 0);
+    CHECK(n >= 0);
+    close(fd);
+    return (size_t)n;
+}
+
+/* T16-01, T16-02, T16-03 */ static void test_script_insert_then_select(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    int errors = -1;
+    ScriptLog log = run_script(db.engine,
+                               "INSERT INTO users VALUES ('kim', 25);\n"
+                               "INSERT INTO users VALUES ('lee', 30);\n"
+                               "SELECT * FROM users WHERE age > 20;\n",
+                               &errors);
+    CHECK(errors == 0);
+    CHECK(log.count == 3);
+    CHECK(log.last_ids[0] == 1 && log.last_ids[1] == 2);
+    CHECK(log.row_counts[2] == 2); /* 앞 문장의 INSERT 가 보인다 */
+    for (int i = 0; i < 3; i++) {
+        CHECK(log.errors[i] == ERR_NONE);
+        CHECK(log.indexes[i] == i + 1);
+    }
+    test_db_destroy(&db);
+}
+
+/* E16-01 */ static void test_script_empty(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    int errors = -1;
+    CHECK(run_script(db.engine, "", &errors).count == 0);
+    CHECK(errors == 0);
+    CHECK(run_script(db.engine, " ;; -- only comment\n", &errors).count == 0);
+    CHECK(errors == 0);
+    test_db_destroy(&db);
+}
+
+/* E16-02, E16-03 */ static void test_script_mixed_errors(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    int errors = -1;
+    ScriptLog log = run_script(db.engine,
+                               "INSERT INTO users VALUES ('kim', 25);\n"
+                               "SELEC * FROM users;\n"
+                               "\n"
+                               "INSERT INTO users\n  VALUES ('lee');\n"
+                               "SELECT * FROM users;",
+                               &errors);
+    CHECK(errors == 2);
+    CHECK(log.count == 4);
+    CHECK(log.errors[0] == ERR_NONE);
+    CHECK(log.errors[1] == ERR_SYNTAX);
+    CHECK(log.errors[2] == ERR_VALUE_COUNT);
+    CHECK(log.errors[3] == ERR_NONE);
+    for (int i = 0; i < 4; i++)
+        CHECK(log.indexes[i] == i + 1);
+    CHECK(log.lines[1] == 2); /* 문법 에러: 문제 토큰 SELEC 의 줄 */
+    CHECK(log.lines[2] == 4); /* 검증 에러: 문장 시작 줄 */
+    CHECK(log.row_counts[3] == 1);
+    test_db_destroy(&db);
+}
+
+/* E16-04 */ static void test_script_all_errors_leave_file(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    insert_ok(db.engine, "INSERT INTO users VALUES ('kim', 25)");
+    uint8_t before[MAX_TABLE_FILE];
+    uint8_t after[MAX_TABLE_FILE];
+    size_t before_len = read_table_file(&db, "users", before);
+
+    int errors = -1;
+    ScriptLog log = run_script(db.engine,
+                               "INSERT INTO users VALUES ('kim');"
+                               "INSERT INTO nope VALUES (1);"
+                               "INSERT INTO users VALUES (1, 'x', 2);"
+                               "SELECT nmae FROM users;"
+                               "INSERT INTO users VALUES ('kim', '25');",
+                               &errors);
+    CHECK(errors == 5);
+    CHECK(log.count == 5);
+    CHECK(read_table_file(&db, "users", after) == before_len);
+    CHECK(memcmp(before, after, before_len) == 0);
+    CHECK(insert_ok(db.engine, "INSERT INTO users VALUES ('lee', 30)") == 2);
+    test_db_destroy(&db);
+}
+
+static void test_script_create_is_rejected(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    int errors = -1;
+    ScriptLog log = run_script(db.engine, "CREATE TABLE t (id INT); SELECT * FROM users",
+                               &errors);
+    CHECK(errors == 1);
+    CHECK(log.errors[0] == ERR_UNSUPPORTED);
+    CHECK(log.errors[1] == ERR_NONE);
+    test_db_destroy(&db);
+}
+
+static void test_script_without_callback(void)
+{
+    TestDb db = open_db(USERS_SQL);
+    CHECK(engine_execute_script(db.engine, "INSERT INTO users VALUES ('kim', 25); SELEC",
+                                NULL, NULL) == 1);
+    CHECK(select_count(db.engine, "SELECT * FROM users") == 1);
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     RUN(test_open_two_tables);
@@ -467,6 +615,12 @@ int main(void)
     RUN(test_select_same_column_twice);
     RUN(test_select_many_rows);
     RUN(test_select_persists_after_reopen);
+    RUN(test_script_insert_then_select);
+    RUN(test_script_empty);
+    RUN(test_script_mixed_errors);
+    RUN(test_script_all_errors_leave_file);
+    RUN(test_script_create_is_rejected);
+    RUN(test_script_without_callback);
     TEST_DONE();
     return 0;
 }

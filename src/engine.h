@@ -21,4 +21,13 @@ void engine_close(Engine *engine);
  * 결과는 호출한 쪽이 result_free 한다. params 는 Phase 3 바인딩용 (지금은 param_count = 0 만). */
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count);
 
+/* 스크립트의 문장 하나가 끝날 때마다 불린다. stmt_index 는 1 부터 (에러 문장 포함, 빈 문장 제외).
+ * result 는 콜백이 돌아온 뒤 엔진이 해제하므로, 남길 값은 콜백 안에서 복사한다. */
+typedef void (*ResultHandler)(const Result *result, int stmt_index, void *ctx);
+
+/* script 의 문장들을 순서대로 실행하고 문장마다 on_result 를 부른다 (NULL 이면 부르지 않음).
+ * 에러가 난 문장도 번호와 줄을 담아 전달하고 다음 문장을 계속 실행한다. 에러 문장 수를 돌려준다.
+ * 파서를 만들 메모리가 없으면 ERR_INTERNAL 결과 하나(번호 0)를 전달하고 1 을 돌려준다. */
+int engine_execute_script(Engine *engine, const char *script, ResultHandler on_result, void *ctx);
+
 #endif

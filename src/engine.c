@@ -177,3 +177,47 @@ Result engine_execute(Engine *engine, const char *sql, const Value *params, int 
     result.elapsed_ms = elapsed_ms_since(&start);
     return result;
 }
+
+/* ---- 스크립트 ---- */
+
+static void deliver(ResultHandler on_result, void *ctx, Result *result, int stmt_index)
+{
+    if (on_result != NULL)
+        on_result(result, stmt_index, ctx);
+    result_free(result); /* 콜백이 끝나면 엔진이 해제한다 */
+}
+
+/* 스크립트 모드 파서에서 꺼낸 문장 하나의 결과. 파싱 에러면 파서의 줄·메시지를 담는다 */
+static Result run_next(Engine *engine, Parser *parser, const Statement *stmt, ErrorCode error)
+{
+    if (error != ERR_NONE)
+        return result_error(error, parser_error_line(parser), "%s", parser_error_message(parser));
+    return execute_statement(engine, stmt);
+}
+
+int engine_execute_script(Engine *engine, const char *script, ResultHandler on_result, void *ctx)
+{
+    Parser *parser = parser_create(script, strlen(script));
+    if (parser == NULL) {
+        Result result = result_error(ERR_INTERNAL, 0, "out of memory");
+        deliver(on_result, ctx, &result, 0);
+        return 1;
+    }
+    int error_count = 0;
+    Statement stmt;
+    ErrorCode error;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    /* 에러 문장은 parser 가 ; 까지 건너뛰어 두므로 다음 호출이 곧 다음 문장이다 */
+    while (parser_next_statement(parser, &stmt, &error)) {
+        Result result = run_next(engine, parser, &stmt, error);
+        statement_free(&stmt);
+        result.elapsed_ms = elapsed_ms_since(&start);
+        if (result.error != ERR_NONE)
+            error_count++;
+        deliver(on_result, ctx, &result, parser_statement_number(parser));
+        clock_gettime(CLOCK_MONOTONIC, &start); /* 콜백(출력) 시간은 다음 문장에 넣지 않는다 */
+    }
+    parser_destroy(parser);
+    return error_count;
+}
