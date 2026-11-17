@@ -25,7 +25,11 @@ BTREE_DEPS   := tests/test_btree.c tests/test.h src/btree.c src/btree.h src/btre
 # 100 만 건 같은 느린 테스트는 이 환경 변수가 1 일 때만 돈다 (make test-slow)
 SLOW_TESTS_ENV := MINIDB_SLOW_TESTS=1
 
-.PHONY: all test test-asan test-order test-slow run clean
+# 벤치마크: 일반 빌드 (-O2) 오브젝트로 링크한다. 데이터는 bench 가 /tmp 아래에 만든다
+BENCH       := build/bench/bench_index
+BENCH_SIZES ?=
+
+.PHONY: all test test-asan test-order test-slow bench run clean
 
 # 테스트 링크에만 쓰이는 오브젝트를 make 가 중간 파일로 보고 지우지 않게 한다 (매번 다시 빌드 방지)
 .SECONDARY: $(LIB_OBJS) $(ASAN_LIB_OBJS)
@@ -70,10 +74,18 @@ test-order: $(ORDER_TESTS)
 test-slow: tests/bin/test_btree $(ASAN_DIR)/tests/test_btree
 	@for t in $^; do echo "== $$t (slow)"; $(SLOW_TESTS_ENV) ./$$t || exit 1; done
 
+$(BENCH): bench/bench_index.c $(LIB_OBJS)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) -MMD $(filter %.c %.o, $^) -o $@ $(LDFLAGS)
+
+# make bench BENCH_SIZES="10000 100000" 로 규모를 바꿀 수 있다 (기본: 1만, 10만, 100만)
+bench: $(BENCH)
+	./$(BENCH) $(BENCH_SIZES)
+
 run: $(BIN)
 	./$(BIN)
 
 clean:
 	rm -rf build tests/bin $(BIN)
 
--include $(wildcard build/*.d $(ASAN_DIR)/*.d tests/bin/*.d $(ASAN_DIR)/tests/*.d)
+-include $(wildcard build/*.d $(ASAN_DIR)/*.d tests/bin/*.d $(ASAN_DIR)/tests/*.d build/bench/*.d)
