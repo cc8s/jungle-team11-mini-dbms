@@ -27,6 +27,16 @@ struct Parser {
     char message[MAX_MESSAGE];
 };
 
+typedef struct {
+    TokenType token;
+    CompareOp op;
+} OperatorEntry;
+
+static const OperatorEntry OPERATORS[] = {
+    { TOK_EQ, OP_EQ }, { TOK_NE, OP_NE }, { TOK_LT, OP_LT },
+    { TOK_GT, OP_GT }, { TOK_LE, OP_LE }, { TOK_GE, OP_GE },
+};
+
 /* 토크나이저에는 없는 SQL 단어지만, 일반 문법 에러 대신 "지원하지 않음" 으로 알려줄 것들 */
 static const char *const UNSUPPORTED_WORDS[] = {
     "update", "delete", "drop", "alter", "order", "group", "having", "join", "offset", "union",
@@ -210,6 +220,45 @@ static ErrorCode expect_statement_end(Parser *parser)
     return fail_at(parser, ERR_SYNTAX, token, "unexpected token at end of statement");
 }
 
+/* ---- 값 ---- */
+
+static bool is_literal(const Token *token)
+{
+    return token->type == TOK_INT || token->type == TOK_STRING || token->type == TOK_PARAM;
+}
+
+/* 문자열 토큰 → Value. 이스케이프를 풀 임시 버퍼를 거친 뒤 value_from_string 으로 복사본을 만든다 */
+static ErrorCode parse_string_value(Parser *parser, const Token *token, Value *out_value)
+{
+    char *text = malloc(token->string_len + 1);
+    if (text == NULL)
+        return fail_at(parser, ERR_INTERNAL, token, "out of memory");
+    tokenizer_copy_string(token, text);
+    *out_value = value_from_string(text, token->string_len);
+    free(text);
+    if (out_value->s.ptr == NULL)
+        return fail_at(parser, ERR_INTERNAL, token, "out of memory");
+    return ERR_NONE;
+}
+
+/* INT | STRING | ?. ? 번호는 문장 안에서 0 부터 다시 센다 (바인딩은 문장 단위이므로) */
+static ErrorCode parse_value(Parser *parser, Statement *stmt, Value *out_value)
+{
+    const Token *token = current(parser);
+    ErrorCode error = ERR_NONE;
+    if (token->type == TOK_INT)
+        *out_value = value_from_int(token->int_value);
+    else if (token->type == TOK_STRING)
+        error = parse_string_value(parser, token, out_value);
+    else if (token->type == TOK_PARAM)
+        *out_value = value_placeholder(stmt->param_count++);
+    else
+        return fail_at(parser, ERR_SYNTAX, token, "expected a value");
+    if (error == ERR_NONE)
+        advance(parser);
+    return error;
+}
+
 /* ---- SELECT ---- */
 
 /* '*' 또는 ident (, ident)*. 같은 컬럼 반복은 허용한다 */
@@ -233,15 +282,86 @@ static ErrorCode parse_select_columns(Parser *parser, SelectStmt *select)
     }
 }
 
-/* SELECT ( * | ident (, ident)* ) FROM ident */
-static ErrorCode parse_select(Parser *parser, SelectStmt *select)
+static bool find_operator(TokenType type, CompareOp *out_op)
 {
+    for (size_t i = 0; i < sizeof(OPERATORS) / sizeof(OPERATORS[0]); i++) {
+        if (OPERATORS[i].token == type) {
+            *out_op = OPERATORS[i].op;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* column op value 한 개. 컬럼은 왼쪽, 값은 오른쪽에만 온다 (계획서 3.7) */
+static ErrorCode parse_condition(Parser *parser, Statement *stmt, Condition *condition)
+{
+    if (is_literal(current(parser)))
+        return fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                       "the column must be on the left side of the comparison");
+    ErrorCode error = expect_identifier(parser, "column name", condition->column);
+    if (error != ERR_NONE)
+        return error;
+
+    if (!find_operator(current(parser)->type, &condition->op))
+        return fail_at(parser, ERR_SYNTAX, current(parser), "expected a comparison operator");
+    advance(parser);
+
+    if (current(parser)->type == TOK_IDENT)
+        return fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                       "comparing two columns is not supported");
+    error = parse_value(parser, stmt, &condition->value);
+    if (error != ERR_NONE)
+        return error;
+
+    if (is_keyword(current(parser), KW_AND) || is_keyword(current(parser), KW_OR))
+        return fail_at(parser, ERR_UNSUPPORTED, current(parser), "AND / OR are not supported");
+    return ERR_NONE;
+}
+
+/* LIMIT 은 0 이상 정수만. -1 은 토크나이저가 INT(-1) 로 읽으므로 여기서 거절한다 */
+static ErrorCode parse_limit(Parser *parser, SelectStmt *select)
+{
+    const Token *token = current(parser);
+    if (token->type != TOK_INT || token->int_value < 0)
+        return fail_at(parser, ERR_SYNTAX, token, "LIMIT needs a non-negative integer");
+    select->has_limit = true;
+    select->limit = token->int_value;
+    advance(parser);
+    return ERR_NONE;
+}
+
+/* [WHERE condition] [LIMIT n] — 이 순서로 각각 한 번만. 순서가 틀리거나 두 번 나오면
+ * 남은 토큰이 되어 expect_statement_end 에서 ERR_SYNTAX 가 난다 */
+static ErrorCode parse_select_clauses(Parser *parser, Statement *stmt)
+{
+    SelectStmt *select = &stmt->select;
+    ErrorCode error = ERR_NONE;
+    if (is_keyword(current(parser), KW_WHERE)) {
+        advance(parser);
+        /* 값을 만들기 전에 켜 두어, 실패해도 statement_free 가 이미 만든 문자열 값을 해제하게 한다 */
+        select->has_where = true;
+        error = parse_condition(parser, stmt, &select->where);
+    }
+    if (error == ERR_NONE && is_keyword(current(parser), KW_LIMIT)) {
+        advance(parser);
+        error = parse_limit(parser, select);
+    }
+    return error;
+}
+
+/* SELECT ( * | ident (, ident)* ) FROM ident [WHERE ...] [LIMIT ...] */
+static ErrorCode parse_select(Parser *parser, Statement *stmt)
+{
+    SelectStmt *select = &stmt->select;
     advance(parser); /* SELECT */
     ErrorCode error = parse_select_columns(parser, select);
     if (error == ERR_NONE)
         error = expect_keyword(parser, KW_FROM, "FROM");
     if (error == ERR_NONE)
         error = expect_identifier(parser, "table name", select->table);
+    if (error == ERR_NONE)
+        error = parse_select_clauses(parser, stmt);
     if (error == ERR_NONE)
         error = expect_statement_end(parser);
     return error;
@@ -255,7 +375,7 @@ static ErrorCode parse_tokens(Parser *parser, Statement *stmt)
     stmt->line = first->line;
     if (is_keyword(first, KW_SELECT)) {
         stmt->type = STMT_SELECT;
-        return parse_select(parser, &stmt->select);
+        return parse_select(parser, stmt);
     }
     if (is_unsupported_word(first))
         return fail_at(parser, ERR_UNSUPPORTED, first, "this statement is not supported");
