@@ -1,4 +1,5 @@
 #include "test.h"
+#include "test_util.h"
 
 #include <stdint.h>
 
@@ -11,27 +12,10 @@
 #define AGE_OFFSET 12
 #define WIDE_SIZE MAX_VARCHAR
 
-/* 출력 캡처: open_memstream 이 text/len 의 주소를 기억해 두고 키워 가며 쓰므로
- * Capture 는 복사하지 말고 한 자리에 둔 채 포인터로 넘긴다 */
-typedef struct {
-    char *text;
-    size_t len;
-    FILE *stream;
-} Capture;
-
-static void capture_open(Capture *capture)
+static void capture_open(TestCapture *capture)
 {
-    capture->text = NULL;
-    capture->len = 0;
-    capture->stream = open_memstream(&capture->text, &capture->len);
+    test_capture_open(capture);
     CHECK(capture->stream != NULL);
-}
-
-/* 스트림을 닫아 text 를 확정한다. 호출한 쪽이 free(text) */
-static char *capture_close(Capture *capture)
-{
-    CHECK(fclose(capture->stream) == 0);
-    return capture->text;
 }
 
 static void put_int(uint8_t *field, int32_t value)
@@ -83,13 +67,13 @@ static Result users_result(const User *users, int count)
 static void check_output(const Result *result, int stmt_index, const char *expected_out,
                          const char *expected_err)
 {
-    Capture out;
-    Capture err;
+    TestCapture out;
+    TestCapture err;
     capture_open(&out);
     capture_open(&err);
     format_result(out.stream, err.stream, result, stmt_index);
-    char *out_text = capture_close(&out);
-    char *err_text = capture_close(&err);
+    char *out_text = test_capture_close(&out);
+    char *err_text = test_capture_close(&err);
     if (strcmp(out_text, expected_out) != 0 || strcmp(err_text, expected_err) != 0)
         fprintf(stderr, "--- out ---\n%s--- err ---\n%s", out_text, err_text);
     CHECK_STR_EQ(out_text, expected_out);
@@ -198,10 +182,10 @@ static void check_output(const Result *result, int stmt_index, const char *expec
     CHECK(result.rows != NULL);
     memset(result.rows, 'x', WIDE_SIZE); /* \0 없이 꽉 참 */
 
-    Capture out;
+    TestCapture out;
     capture_open(&out);
     format_result(out.stream, stderr, &result, 1);
-    char *text = capture_close(&out);
+    char *text = test_capture_close(&out);
     char row[2 + WIDE_SIZE + 4]; /* "| " + 값 + " |\n" + \0 */
     row[0] = '|';
     row[1] = ' ';

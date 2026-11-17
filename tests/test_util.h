@@ -50,6 +50,42 @@ static inline bool test_remove_dir(const char *path)
     return nftw(path, remove_visited_entry, TEST_NFTW_OPEN_FDS, FTW_DEPTH | FTW_PHYS) == 0;
 }
 
+/* 출력 캡처: open_memstream 이 text/len 의 주소를 기억해 두고 키워 가며 쓰므로
+ * TestCapture 는 복사하지 말고 한 자리에 둔 채 포인터로 넘긴다 */
+typedef struct {
+    char *text;
+    size_t len;
+    FILE *stream;
+} TestCapture;
+
+/* 실패하면 stream 이 NULL */
+static inline void test_capture_open(TestCapture *capture)
+{
+    capture->text = NULL;
+    capture->len = 0;
+    capture->stream = open_memstream(&capture->text, &capture->len);
+}
+
+/* 스트림을 닫아 text 를 확정한다. 호출한 쪽이 free(text) */
+static inline char *test_capture_close(TestCapture *capture)
+{
+    fclose(capture->stream);
+    capture->stream = NULL;
+    return capture->text;
+}
+
+/* dir/name 에 text 를 쓰고 경로를 out_path 에 남긴다. 성공하면 true */
+static inline bool test_write_file(const char *dir, const char *name, const char *text,
+                                   char *out_path)
+{
+    snprintf(out_path, TEST_PATH_MAX, "%s/%s", dir, name);
+    FILE *file = fopen(out_path, "w"); /* 테스트 준비용 (엔진의 pread/pwrite 규칙 대상 아님) */
+    if (file == NULL)
+        return false;
+    bool is_ok = fputs(text, file) >= 0;
+    return fclose(file) == 0 && is_ok;
+}
+
 /* 엔진 테스트용 데이터 디렉터리 묶음. create_sql 의 CREATE TABLE 들로 테이블을 만든 뒤 엔진을 연다. */
 typedef struct {
     char *dir;      /* 실패하면 NULL */
