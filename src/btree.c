@@ -335,6 +335,43 @@ bool btree_search(const BTree *tree, int32_t key, uint64_t *out_value)
     return true;
 }
 
+/* ---- 범위 순회 ---- */
+
+/* low 가 들어갈 리프에서 low 이상인 첫 자리를 잡는다. 그 리프의 키가 모두 low 보다 작으면
+ * index = num_keys 가 되고, iter_next 가 다음 리프로 넘어간다. 다음 리프의 키는 모두
+ * 구분 키 이상이고 구분 키 > low 이므로 빠뜨리는 키가 없다. */
+BTreeIter btree_seek(const BTree *tree, int32_t low)
+{
+    const BNode *leaf = tree_find_leaf(tree, low);
+    BTreeIter iter = {leaf, node_lower_bound(leaf, low)};
+    return iter;
+}
+
+BTreeIter btree_seek_first(const BTree *tree)
+{
+    const BNode *node = tree->root;
+    while (!node->is_leaf)
+        node = node->children[0];
+    BTreeIter iter = {node, 0};
+    return iter;
+}
+
+/* 범위 검색이 트리를 다시 내려가지 않고 리프 연결 리스트만 따라가는 부분이다.
+ * 빈 리프 (빈 트리의 루트) 도 건너뛸 수 있게 while 로 넘긴다. */
+bool btree_iter_next(BTreeIter *iter, int32_t *out_key, uint64_t *out_value)
+{
+    while (iter->leaf != NULL && iter->index >= iter->leaf->num_keys) {
+        iter->leaf = iter->leaf->next;
+        iter->index = 0;
+    }
+    if (iter->leaf == NULL)
+        return false;
+    *out_key = iter->leaf->keys[iter->index];
+    *out_value = iter->leaf->values[iter->index];
+    iter->index++;
+    return true;
+}
+
 int64_t btree_size(const BTree *tree)
 {
     return tree->size;

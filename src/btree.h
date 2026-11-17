@@ -35,6 +35,25 @@ int btree_insert(BTree *tree, int32_t key, uint64_t value);
 /* key 를 찾으면 *out_value 에 값을 쓰고 true. 없으면 false 이고 *out_value 는 건드리지 않는다 */
 bool btree_search(const BTree *tree, int32_t key, uint64_t *out_value);
 
+/* ---- 범위 순회 ----
+ * 반복자는 "다음에 돌려줄 리프와 그 안의 위치" 다. 값으로 주고받으며 해제할 것이 없다.
+ * 필드는 btree 모듈 안에서만 쓴다 (호출하는 쪽은 seek 으로 만들고 iter_next 로만 움직인다).
+ * 순회 중에 트리를 바꾸면 반복자는 무효가 된다 (Phase 3 에서는 읽기 락 안에서만 순회). */
+typedef struct {
+    const struct BNode *leaf; /* NULL 이면 끝 */
+    int index;
+} BTreeIter;
+
+/* low 이상인 첫 키부터 순회하는 반복자. 그런 키가 없으면 첫 btree_iter_next 가 false */
+BTreeIter btree_seek(const BTree *tree, int32_t low);
+
+/* 가장 작은 키부터 순회하는 반복자 (가장 왼쪽 리프의 처음) */
+BTreeIter btree_seek_first(const BTree *tree);
+
+/* 다음 (key, value) 를 out 인자에 쓰고 한 칸 나아간다. 리프 끝이면 next 리프로 넘어간다.
+ * 더 없으면 false 이고 out 인자는 건드리지 않는다. 끝난 뒤 다시 불러도 계속 false */
+bool btree_iter_next(BTreeIter *iter, int32_t *out_key, uint64_t *out_value);
+
 /* 등록된 키 개수 */
 int64_t btree_size(const BTree *tree);
 

@@ -558,6 +558,157 @@ static void test_alloc_failure_keeps_tree(void)
     }
 }
 
+/* ---- S23 범위 순회 ---- */
+
+#define RANGE_KEY_COUNT 1000
+#define RANGE_TAKE_COUNT 10
+#define BOUNDARY_BACKOFF 2 /* 리프 마지막 키보다 이만큼 앞에서 시작해 경계를 넘는다 */
+
+/* first, first + step, ... 을 count 개 넣은 트리 (값 = 키) */
+static BTree *create_range_tree(int32_t first, int32_t step, int count)
+{
+    BTree *tree = create_tree();
+    for (int i = 0; i < count; i++) {
+        int32_t key = first + i * step;
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    }
+    return tree;
+}
+
+/* 반복자에서 count 개를 꺼내 first, first + step, ... 인지 확인한다 (값도 키와 같아야 함) */
+static void check_iter_sequence(BTreeIter *iter, int32_t first, int32_t step, int count)
+{
+    for (int i = 0; i < count; i++) {
+        int32_t key = 0;
+        uint64_t value = SENTINEL_VALUE;
+        CHECK(btree_iter_next(iter, &key, &value));
+        CHECK(key == first + i * step);
+        CHECK(value == (uint64_t)key);
+    }
+}
+
+static void check_iter_exhausted(BTreeIter *iter)
+{
+    int32_t key = 0;
+    uint64_t value = 0;
+    CHECK(!btree_iter_next(iter, &key, &value));
+}
+
+/* T23-01 */
+static void test_seek_then_take_ten(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    BTreeIter iter = btree_seek(tree, 500);
+    check_iter_sequence(&iter, 500, 1, RANGE_TAKE_COUNT);
+    destroy_checked(tree);
+}
+
+/* T23-02 */
+static void test_seek_first_visits_all(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    BTreeIter iter = btree_seek_first(tree);
+    check_iter_sequence(&iter, 1, 1, RANGE_KEY_COUNT);
+    check_iter_exhausted(&iter);
+    destroy_checked(tree);
+}
+
+/* T23-03 */
+static void test_iterate_across_leaf_boundary(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    const BNode *first_leaf = leftmost_leaf(tree);
+    CHECK(first_leaf->next != NULL); /* 리프가 여러 개여야 경계를 넘는다 */
+    /* 첫 리프 끝 근처에서 시작한다. 작은 차수면 리프가 짧으니 첫 리프 안으로 제한한다 */
+    int32_t start = first_leaf->keys[first_leaf->num_keys - 1] - BOUNDARY_BACKOFF;
+    if (start < first_leaf->keys[0])
+        start = first_leaf->keys[0];
+    BTreeIter iter = btree_seek(tree, start);
+    check_iter_sequence(&iter, start, 1, RANGE_TAKE_COUNT); /* 빠짐·중복이 있으면 순서가 어긋남 */
+    destroy_checked(tree);
+}
+
+/* T23-04 */
+static void test_seek_between_keys(void)
+{
+    BTree *tree = create_range_tree(2, 2, RANGE_KEY_COUNT / 2); /* 2, 4, ..., 1000 */
+    BTreeIter iter = btree_seek(tree, 5);
+    check_iter_sequence(&iter, 6, 2, RANGE_TAKE_COUNT);
+    destroy_checked(tree);
+}
+
+/* E23-01 */
+static void test_seek_empty_tree(void)
+{
+    BTree *tree = create_tree();
+    BTreeIter iter = btree_seek(tree, 1);
+    check_iter_exhausted(&iter);
+    BTreeIter first = btree_seek_first(tree);
+    check_iter_exhausted(&first);
+    destroy_checked(tree);
+}
+
+/* E23-02 */
+static void test_seek_past_last_key(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    BTreeIter iter = btree_seek(tree, RANGE_KEY_COUNT + 1);
+    check_iter_exhausted(&iter);
+    destroy_checked(tree);
+}
+
+/* E23-03 */
+static void test_seek_before_first_key(void)
+{
+    BTree *tree = create_range_tree(100, 1, RANGE_KEY_COUNT);
+    BTreeIter iter = btree_seek(tree, -5);
+    check_iter_sequence(&iter, 100, 1, RANGE_TAKE_COUNT);
+    destroy_checked(tree);
+}
+
+/* E23-04 */
+static void test_iter_next_after_end(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    BTreeIter iter = btree_seek(tree, RANGE_KEY_COUNT);
+    check_iter_sequence(&iter, RANGE_KEY_COUNT, 1, 1);
+    for (int i = 0; i < RANGE_TAKE_COUNT; i++)
+        check_iter_exhausted(&iter);
+    destroy_checked(tree);
+}
+
+/* E23-05 */
+static void test_seek_extreme_bounds(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    BTreeIter from_min = btree_seek(tree, INT32_MIN);
+    check_iter_sequence(&from_min, 1, 1, RANGE_TAKE_COUNT);
+    BTreeIter absent_max = btree_seek(tree, INT32_MAX); /* INT32_MAX 가 없으면 빈 결과 */
+    check_iter_exhausted(&absent_max);
+
+    CHECK(btree_insert(tree, INT32_MAX, (uint64_t)INT32_MAX) == BTREE_OK);
+    BTreeIter present_max = btree_seek(tree, INT32_MAX); /* 있으면 정확히 하나 */
+    check_iter_sequence(&present_max, INT32_MAX, 1, 1);
+    check_iter_exhausted(&present_max);
+    destroy_checked(tree);
+}
+
+/* E23-06 */
+static void test_seek_leaf_first_and_last_key(void)
+{
+    BTree *tree = create_range_tree(1, 1, RANGE_KEY_COUNT);
+    const BNode *middle = leftmost_leaf(tree)->next;
+    CHECK(middle != NULL && middle->next != NULL);
+    int32_t first = middle->keys[0];
+    int32_t last = middle->keys[middle->num_keys - 1];
+
+    BTreeIter from_first = btree_seek(tree, first);
+    check_iter_sequence(&from_first, first, 1, RANGE_TAKE_COUNT);
+    BTreeIter from_last = btree_seek(tree, last); /* 마지막 키 다음은 오른쪽 리프의 첫 키 */
+    check_iter_sequence(&from_last, last, 1, RANGE_TAKE_COUNT);
+    destroy_checked(tree);
+}
+
 int main(void)
 {
     printf("test_btree\n");
@@ -588,6 +739,16 @@ int main(void)
     RUN(test_internal_split_on_leftmost_path);
     RUN(test_internal_split_on_rightmost_path);
     RUN(test_alloc_failure_keeps_tree);
+    RUN(test_seek_then_take_ten);
+    RUN(test_seek_first_visits_all);
+    RUN(test_iterate_across_leaf_boundary);
+    RUN(test_seek_between_keys);
+    RUN(test_seek_empty_tree);
+    RUN(test_seek_past_last_key);
+    RUN(test_seek_before_first_key);
+    RUN(test_iter_next_after_end);
+    RUN(test_seek_extreme_bounds);
+    RUN(test_seek_leaf_first_and_last_key);
     TEST_DONE();
     return 0;
 }
