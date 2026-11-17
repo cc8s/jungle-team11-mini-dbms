@@ -1,5 +1,6 @@
 #include "json.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,10 @@
 #define DECIMAL_BASE 10
 #define INITIAL_KEY_CAPACITY 4
 #define END_OF_TEXT (-1)
+#define INITIAL_BUF_CAPACITY 256
+#define NUMBER_TEXT_SIZE 32      /* int64 또는 %.3f 숫자 하나 */
+#define CONTROL_ESCAPE_SIZE 7    /* "\u001f" + \0 */
+#define FIRST_PRINTABLE 0x20
 
 /* 파서 상태. 문법 오류는 처음 것 하나만 기록하고 바로 멈춘다.
  * params 오류는 기록만 하고 계속 읽는다: 뒤에 문법 오류가 있으면 그쪽을 알려야 하기 때문 */
@@ -604,4 +609,194 @@ void query_request_free(QueryRequest *request)
     for (int i = 0; i < request->param_count; i++)
         value_free(&request->params[i]);
     request->param_count = 0;
+}
+
+/* ---- 응답 버퍼 ---- */
+
+void json_buf_init(JsonBuf *buf)
+{
+    *buf = (JsonBuf){NULL, 0, 0, false};
+}
+
+void json_buf_free(JsonBuf *buf)
+{
+    free(buf->data);
+    json_buf_init(buf);
+}
+
+/* 모자라면 2 배씩 늘린다: n 바이트를 붙이는 데 복사가 O(n) 으로 끝난다. +1 은 끝의 \0 자리 */
+static bool reserve(JsonBuf *buf, size_t extra)
+{
+    if (buf->is_out_of_memory)
+        return false;
+    size_t needed = buf->len + extra + 1;
+    if (needed <= buf->capacity)
+        return true;
+    size_t capacity = buf->capacity == 0 ? INITIAL_BUF_CAPACITY : buf->capacity;
+    while (capacity < needed)
+        capacity *= 2;
+    char *grown = realloc(buf->data, capacity);
+    if (grown == NULL) {
+        buf->is_out_of_memory = true;
+        return false;
+    }
+    buf->data = grown;
+    buf->capacity = capacity;
+    return true;
+}
+
+void json_buf_append(JsonBuf *buf, const char *text, size_t len)
+{
+    if (!reserve(buf, len))
+        return;
+    memcpy(buf->data + buf->len, text, len);
+    buf->len += len;
+    buf->data[buf->len] = '\0';
+}
+
+void json_buf_append_text(JsonBuf *buf, const char *text)
+{
+    json_buf_append(buf, text, strlen(text));
+}
+
+void json_buf_append_int(JsonBuf *buf, int64_t number)
+{
+    char text[NUMBER_TEXT_SIZE];
+    int len = snprintf(text, sizeof(text), "%" PRId64, number);
+    json_buf_append(buf, text, (size_t)len);
+}
+
+/* 이스케이프가 필요한 바이트의 표기. 필요 없으면 NULL. 짧은 표기가 있는 것은 그것을, 나머지 제어 문자는
+ * \u00XX 를 쓴다 (control 버퍼에 만든다) */
+static const char *escape_of(unsigned char c, char control[CONTROL_ESCAPE_SIZE])
+{
+    switch (c) {
+    case '"': return "\\\"";
+    case '\\': return "\\\\";
+    case '\n': return "\\n";
+    case '\r': return "\\r";
+    case '\t': return "\\t";
+    case '\b': return "\\b";
+    case '\f': return "\\f";
+    default: break;
+    }
+    if (c >= FIRST_PRINTABLE)
+        return NULL;
+    snprintf(control, CONTROL_ESCAPE_SIZE, "\\u%04x", c);
+    return control;
+}
+
+/* 이스케이프할 필요 없는 바이트는 한 덩어리로 모아서 붙인다 (바이트마다 append 하지 않음) */
+void json_buf_append_escaped(JsonBuf *buf, const char *text, size_t len)
+{
+    json_buf_append(buf, "\"", 1);
+    size_t run_start = 0;
+    for (size_t i = 0; i < len; i++) {
+        char control[CONTROL_ESCAPE_SIZE];
+        const char *escaped = escape_of((unsigned char)text[i], control);
+        if (escaped == NULL)
+            continue;
+        json_buf_append(buf, text + run_start, i - run_start);
+        json_buf_append_text(buf, escaped);
+        run_start = i + 1;
+    }
+    json_buf_append(buf, text + run_start, len - run_start);
+    json_buf_append(buf, "\"", 1);
+}
+
+/* ---- Result → JSON ---- */
+
+static void append_bool(JsonBuf *buf, bool value)
+{
+    json_buf_append_text(buf, value ? "true" : "false");
+}
+
+static void append_elapsed(JsonBuf *buf, double elapsed_ms)
+{
+    char text[NUMBER_TEXT_SIZE];
+    int len = snprintf(text, sizeof(text), "%.3f", elapsed_ms);
+    json_buf_append_text(buf, ",\"elapsed_ms\":");
+    json_buf_append(buf, text, (size_t)len);
+}
+
+static void append_columns(JsonBuf *buf, const Result *result)
+{
+    json_buf_append_text(buf, "\"columns\":[");
+    for (int col = 0; col < result->column_count; col++) {
+        if (col > 0)
+            json_buf_append(buf, ",", 1);
+        const char *name = result->columns[col].name;
+        json_buf_append_escaped(buf, name, strlen(name));
+    }
+    json_buf_append(buf, "]", 1);
+}
+
+/* 행 하나: 정수 칸은 숫자, VARCHAR 칸은 문자열 ([3,"park",22]) */
+static void append_row(JsonBuf *buf, const Result *result, int64_t row)
+{
+    json_buf_append(buf, "[", 1);
+    for (int col = 0; col < result->column_count; col++) {
+        if (col > 0)
+            json_buf_append(buf, ",", 1);
+        if (result->columns[col].type == COL_INT) {
+            json_buf_append_int(buf, result_get_int(result, row, col));
+            continue;
+        }
+        size_t len = 0;
+        const char *text = result_get_str(result, row, col, &len);
+        json_buf_append_escaped(buf, text, len);
+    }
+    json_buf_append(buf, "]", 1);
+}
+
+static void append_select(JsonBuf *buf, const Result *result, int64_t max_rows)
+{
+    int64_t shown = result->row_count < max_rows ? result->row_count : max_rows;
+    json_buf_append_text(buf, "{\"ok\":true,");
+    append_columns(buf, result);
+    json_buf_append_text(buf, ",\"rows\":[");
+    for (int64_t row = 0; row < shown; row++) {
+        if (row > 0)
+            json_buf_append(buf, ",", 1);
+        append_row(buf, result, row);
+    }
+    json_buf_append_text(buf, "],\"row_count\":");
+    json_buf_append_int(buf, result->row_count);
+    json_buf_append_text(buf, ",\"truncated\":");
+    append_bool(buf, result->row_count > shown);
+    json_buf_append_text(buf, ",\"used_index\":");
+    append_bool(buf, result->used_index);
+    append_elapsed(buf, result->elapsed_ms);
+    json_buf_append(buf, "}", 1);
+}
+
+static void append_insert(JsonBuf *buf, const Result *result)
+{
+    json_buf_append_text(buf, "{\"ok\":true,\"affected_rows\":");
+    json_buf_append_int(buf, result->affected_rows);
+    json_buf_append_text(buf, ",\"last_insert_id\":");
+    json_buf_append_int(buf, result->last_insert_id);
+    append_elapsed(buf, result->elapsed_ms);
+    json_buf_append(buf, "}", 1);
+}
+
+static void append_error(JsonBuf *buf, const Result *result)
+{
+    json_buf_append_text(buf, "{\"ok\":false,\"error\":{\"code\":");
+    const char *code = error_name(result->error);
+    json_buf_append_escaped(buf, code, strlen(code));
+    json_buf_append_text(buf, ",\"message\":");
+    json_buf_append_escaped(buf, result->message, strnlen(result->message, MAX_MESSAGE));
+    json_buf_append_text(buf, "}}");
+}
+
+ErrorCode json_write_result(const Result *result, int64_t max_rows, JsonBuf *out_buf)
+{
+    if (result->error != ERR_NONE)
+        append_error(out_buf, result);
+    else if (result->column_count > 0)
+        append_select(out_buf, result, max_rows < 0 ? 0 : max_rows);
+    else
+        append_insert(out_buf, result);
+    return out_buf->is_out_of_memory ? ERR_INTERNAL : ERR_NONE;
 }

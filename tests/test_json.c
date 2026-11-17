@@ -267,6 +267,216 @@ static void test_nul_byte_in_body(void)
     query_request_free(&request);
 }
 
+/* ---- S35 응답 ---- */
+
+#define USERS_RECORD_SIZE 40 /* id 4 + name 32 + age 4 */
+#define NAME_SIZE 32
+#define ROW_LIMIT 1000
+#define WIDE_VARCHAR 1024
+#define FIXED_ELAPSED_MS 0.25
+
+/* users (id INT, name VARCHAR(32), age INT) 모양의 SELECT 결과를 만든다. rows 는 행 수만큼 할당 */
+static Result make_users_result(int64_t row_count)
+{
+    Result result;
+    result_init(&result);
+    const char *names[] = {"id", "name", "age"};
+    const ColumnType types[] = {COL_INT, COL_VARCHAR, COL_INT};
+    const int sizes[] = {4, NAME_SIZE, 4};
+    int offset = 0;
+    for (int i = 0; i < 3; i++) {
+        snprintf(result.columns[i].name, MAX_NAME, "%s", names[i]);
+        result.columns[i].type = types[i];
+        result.columns[i].size = sizes[i];
+        result.columns[i].offset = offset;
+        offset += sizes[i];
+    }
+    result.column_count = 3;
+    result.record_size = USERS_RECORD_SIZE;
+    result.row_count = row_count;
+    result.rows = calloc((size_t)(row_count > 0 ? row_count : 1), USERS_RECORD_SIZE);
+    CHECK(result.rows != NULL);
+    result.elapsed_ms = FIXED_ELAPSED_MS;
+    return result;
+}
+
+static void put_int(uint8_t *cell, int32_t value)
+{
+    uint32_t bits = (uint32_t)value;
+    for (int i = 0; i < 4; i++)
+        cell[i] = (uint8_t)((bits >> (8 * i)) & 0xFF);
+}
+
+static void put_user(Result *result, int64_t row, int32_t id, const char *name, int32_t age)
+{
+    uint8_t *record = result->rows + row * result->record_size;
+    put_int(record, id);
+    memset(record + 4, 0, NAME_SIZE);
+    memcpy(record + 4, name, strnlen(name, NAME_SIZE));
+    put_int(record + 4 + NAME_SIZE, age);
+}
+
+/* result 를 JSON 으로 써서 문자열로 돌려준다 (호출한 쪽이 free) */
+static char *to_json(const Result *result, int64_t max_rows)
+{
+    JsonBuf buf;
+    json_buf_init(&buf);
+    CHECK(json_write_result(result, max_rows, &buf) == ERR_NONE);
+    CHECK(!buf.is_out_of_memory);
+    CHECK(strlen(buf.data) == buf.len);
+    return buf.data; /* 소유권을 넘긴다 */
+}
+
+/* JSON 문자열 하나 (escaped) 를 {"sql": ...} 로 감싸 다시 파싱해서 원래 값이 나오는지 */
+static void check_round_trip(const char *value, size_t len)
+{
+    JsonBuf buf;
+    json_buf_init(&buf);
+    json_buf_append_text(&buf, "{\"sql\":");
+    json_buf_append_escaped(&buf, value, len);
+    json_buf_append_text(&buf, "}");
+    CHECK(!buf.is_out_of_memory);
+    QueryRequest request;
+    char message[MAX_MESSAGE];
+    CHECK(json_parse_query(buf.data, buf.len, &request, message) == JSON_OK);
+    CHECK(request.sql_len == len && memcmp(request.sql, value, len) == 0);
+    query_request_free(&request);
+    json_buf_free(&buf);
+}
+
+/* T35-01, T35-04 */
+static void test_select_json(void)
+{
+    Result result = make_users_result(3);
+    put_user(&result, 0, 1, "kim", 25);
+    put_user(&result, 1, 2, "lee", 30);
+    put_user(&result, 2, 3, "park", 22);
+    result.used_index = true;
+    char *json = to_json(&result, ROW_LIMIT);
+    CHECK_STR_EQ(json, "{\"ok\":true,\"columns\":[\"id\",\"name\",\"age\"],"
+                       "\"rows\":[[1,\"kim\",25],[2,\"lee\",30],[3,\"park\",22]],"
+                       "\"row_count\":3,\"truncated\":false,\"used_index\":true,"
+                       "\"elapsed_ms\":0.250}");
+    free(json);
+    result_free(&result);
+}
+
+/* T35-02 */
+static void test_insert_json(void)
+{
+    Result result;
+    result_init(&result);
+    result.affected_rows = 1;
+    result.last_insert_id = 7;
+    result.elapsed_ms = FIXED_ELAPSED_MS;
+    char *json = to_json(&result, ROW_LIMIT);
+    CHECK_STR_EQ(json, "{\"ok\":true,\"affected_rows\":1,\"last_insert_id\":7,"
+                       "\"elapsed_ms\":0.250}");
+    free(json);
+}
+
+/* T35-03, E35-02 */
+static void test_error_json(void)
+{
+    Result result = result_error(ERR_UNKNOWN_COLUMN, 1, "Unknown column 'nmae' in table 'users'");
+    char *json = to_json(&result, ROW_LIMIT);
+    CHECK_STR_EQ(json, "{\"ok\":false,\"error\":{\"code\":\"UNKNOWN_COLUMN\","
+                       "\"message\":\"Unknown column 'nmae' in table 'users'\"}}");
+    free(json);
+    result = result_error(ERR_SYNTAX, 1, "near \"it's\" \\ here");
+    json = to_json(&result, ROW_LIMIT);
+    CHECK(strstr(json, "\"message\":\"near \\\"it's\\\" \\\\ here\"") != NULL);
+    free(json);
+}
+
+/* E35-01 */
+static void test_escape_round_trip(void)
+{
+    const char *values[] = {"a\"b", "back\\slash", "line\nbreak", "tab\there", "\r\b\f",
+                            "\x01\x1f", "</script>", "plain"};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++)
+        check_round_trip(values[i], strlen(values[i]));
+    JsonBuf buf;
+    json_buf_init(&buf);
+    json_buf_append_escaped(&buf, "a\"\\\n\t\x01", 6);
+    CHECK_STR_EQ(buf.data, "\"a\\\"\\\\\\n\\t\\u0001\"");
+    json_buf_free(&buf);
+}
+
+/* E35-03 */
+static void test_zero_rows(void)
+{
+    Result result = make_users_result(0);
+    char *json = to_json(&result, ROW_LIMIT);
+    CHECK(strstr(json, "\"rows\":[],\"row_count\":0,\"truncated\":false") != NULL);
+    free(json);
+    result_free(&result);
+}
+
+static int64_t count_rows_in_json(const char *json)
+{
+    int64_t count = 0;
+    for (const char *p = strstr(json, "\"rows\":["); p != NULL && *p != '\0'; p++) {
+        if (p[0] == '[' && p[1] != '[' && p[-1] != ':')
+            count++;
+        if (p[0] == ']' && p[1] == ',' && p[2] == '"')
+            break;
+    }
+    return count;
+}
+
+/* E35-04, E35-05 */
+static void test_row_limit(void)
+{
+    int64_t counts[] = {ROW_LIMIT + 1, ROW_LIMIT};
+    for (int k = 0; k < 2; k++) {
+        Result result = make_users_result(counts[k]);
+        for (int64_t row = 0; row < counts[k]; row++)
+            put_user(&result, row, (int32_t)row + 1, "u", 1);
+        char *json = to_json(&result, ROW_LIMIT);
+        CHECK(count_rows_in_json(json) == ROW_LIMIT);
+        char expected[64];
+        snprintf(expected, sizeof(expected), "\"row_count\":%lld,\"truncated\":%s",
+                 (long long)counts[k], counts[k] > ROW_LIMIT ? "true" : "false");
+        CHECK(strstr(json, expected) != NULL);
+        free(json);
+        result_free(&result);
+    }
+}
+
+/* E35-06, E35-07 */
+static void test_korean_and_extreme_ints(void)
+{
+    Result result = make_users_result(2);
+    put_user(&result, 0, INT32_MIN, "김철수", -1);
+    put_user(&result, 1, INT32_MAX, "", 0);
+    char *json = to_json(&result, ROW_LIMIT);
+    CHECK(strstr(json, "[[-2147483648,\"김철수\",-1],[2147483647,\"\",0]]") != NULL);
+    free(json);
+    result_free(&result);
+}
+
+/* E35-08 */
+static void test_wide_rows_grow_buffer(void)
+{
+    Result result;
+    result_init(&result);
+    snprintf(result.columns[0].name, MAX_NAME, "memo");
+    result.columns[0].type = COL_VARCHAR;
+    result.columns[0].size = WIDE_VARCHAR;
+    result.column_count = 1;
+    result.record_size = WIDE_VARCHAR;
+    result.row_count = ROW_LIMIT;
+    result.rows = malloc((size_t)ROW_LIMIT * WIDE_VARCHAR);
+    CHECK(result.rows != NULL);
+    memset(result.rows, 'z', (size_t)ROW_LIMIT * WIDE_VARCHAR); /* 칸이 꽉 차 \0 이 없다 */
+    char *json = to_json(&result, ROW_LIMIT);
+    CHECK(strlen(json) > (size_t)ROW_LIMIT * WIDE_VARCHAR);
+    CHECK(strstr(json, "\"truncated\":false") != NULL);
+    free(json);
+    result_free(&result);
+}
+
 int main(void)
 {
     printf("test_json\n");
@@ -291,6 +501,14 @@ int main(void)
     RUN(test_trailing_garbage);
     RUN(test_deep_nesting);
     RUN(test_nul_byte_in_body);
+    RUN(test_select_json);
+    RUN(test_insert_json);
+    RUN(test_error_json);
+    RUN(test_escape_round_trip);
+    RUN(test_zero_rows);
+    RUN(test_row_limit);
+    RUN(test_korean_and_extreme_ints);
+    RUN(test_wide_rows_grow_buffer);
     TEST_DONE();
     return 0;
 }
