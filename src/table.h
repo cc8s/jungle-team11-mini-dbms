@@ -47,4 +47,24 @@ bool table_build_path(const char *data_dir, const char *table_name, char *out_pa
  * 헤더를 쓰다 실패하면 반쯤 만든 파일을 지운다. */
 ErrorCode table_create(const char *path, const CreateStmt *create);
 
+/* 열린 테이블. 파일 fd 를 닫을 때까지 쥐고 있다 (INSERT 마다 열고 닫지 않는다). */
+typedef struct Table Table;
+
+/* path 의 .tbl 파일을 읽기·쓰기로 열고 헤더를 검사한다. 테이블 이름은 파일 이름에서 .tbl 을 뗀 것.
+ * 실패하면 NULL 이고 *out_error 에 이유를 쓴다:
+ *   ERR_IO      파일을 열거나 읽을 수 없음 (없음, 권한, 디렉터리 등)
+ *   ERR_CORRUPT 헤더보다 작음, magic·version·컬럼·record_size 이상, 레코드가 row_count 보다 모자람
+ *   ERR_INTERNAL 메모리 부족
+ * 파일이 예상보다 크면 (쓰다 만 레코드) row_count 까지만 테이블로 보고 정상으로 연다. */
+Table *table_open(const char *path, ErrorCode *out_error);
+void table_close(Table *table);
+
+const char *table_name(const Table *table);
+int table_column_count(const Table *table);
+/* index 번째 컬럼 정의 (0 <= index < table_column_count) */
+const ColumnDef *table_column(const Table *table, int index);
+/* 이름이 정확히 같은 컬럼을 찾는다 (이름은 파서가 소문자로 정규화한다). 없으면 false */
+bool table_find_column(const Table *table, const char *name, int *out_index);
+int32_t table_record_count(const Table *table);
+
 #endif

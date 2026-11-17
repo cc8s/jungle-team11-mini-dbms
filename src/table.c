@@ -1,6 +1,7 @@
 #include "table.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,8 @@
 #define COLUMN_SIZE_OFFSET (COLUMN_NAME_SIZE + 4)
 #define COLUMN_ENTRY_SIZE (COLUMN_NAME_SIZE + 8) /* name 32B + type 4B + size 4B */
 #define TABLE_FILE_MODE 0644
+#define ID_COLUMN_NAME "id"
+#define INT_COLUMN_SIZE ((int32_t)sizeof(int32_t))
 
 _Static_assert(COLUMNS_OFFSET + MAX_COLUMNS * COLUMN_ENTRY_SIZE <= HEADER_SIZE,
                "header must fit MAX_COLUMNS columns");
@@ -122,6 +125,21 @@ bool table_build_path(const char *data_dir, const char *table_name, char *out_pa
     return len >= 0 && (size_t)len < path_size;
 }
 
+/* pread 도 요청보다 적게 읽을 수 있으므로 다 읽을 때까지 이어서 읽는다. 파일 끝에 먼저 닿으면 false */
+static bool read_all_at(int fd, uint8_t *bytes, size_t len, off_t offset)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = pread(fd, bytes + done, len - done, offset + (off_t)done);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
 /* pwrite 는 요청보다 적게 쓸 수 있으므로 다 쓸 때까지 이어서 쓴다 */
 static bool write_all_at(int fd, const uint8_t *bytes, size_t len, off_t offset)
 {
@@ -154,4 +172,157 @@ ErrorCode table_create(const char *path, const CreateStmt *create)
         return ERR_NONE;
     unlink(path); /* 헤더가 덜 쓰인 파일은 다음 열기에서 손상으로 보이므로 남기지 않는다 */
     return ERR_IO;
+}
+
+/* ---- 열기 ---- */
+
+struct Table {
+    int fd;
+    char name[MAX_NAME];
+    TableHeader header;
+};
+
+static bool is_valid_column(const ColumnDef *column)
+{
+    if (column->name[0] == '\0')
+        return false;
+    if (column->type == COL_INT)
+        return column->size == INT_COLUMN_SIZE;
+    if (column->type == COL_VARCHAR)
+        return column->size >= 1 && column->size <= MAX_VARCHAR;
+    return false;
+}
+
+/* 컬럼 정의를 검사하고 크기 합을 돌려준다. 하나라도 이상하면 false.
+ * 합은 int64 로 더한다: 손상된 size 값이 int32 덧셈을 넘치게 만들 수 있다 */
+static bool check_columns(const TableHeader *header, int64_t *out_record_size)
+{
+    if (header->column_count < 1 || header->column_count > MAX_COLUMNS)
+        return false;
+    const ColumnDef *first = &header->columns[0];
+    if (strcmp(first->name, ID_COLUMN_NAME) != 0 || first->type != COL_INT)
+        return false;
+    int64_t sum = 0;
+    for (int i = 0; i < header->column_count; i++) {
+        if (!is_valid_column(&header->columns[i]))
+            return false;
+        sum += header->columns[i].size;
+    }
+    *out_record_size = sum;
+    return true;
+}
+
+/* 계획서 3.7 의 열기 규칙. file_size 는 fstat 으로 잰 실제 크기 */
+static bool is_valid_header(const TableHeader *header, off_t file_size)
+{
+    int64_t record_size = 0;
+    if (memcmp(header->magic, TABLE_MAGIC, TABLE_MAGIC_LEN) != 0)
+        return false;
+    if (header->version != TABLE_VERSION)
+        return false;
+    if (!check_columns(header, &record_size) || record_size != header->record_size)
+        return false;
+    if (header->row_count < 0)
+        return false;
+    /* 모자라면 손상, 남으면 쓰다 만 레코드로 보고 row_count 까지만 쓴다 */
+    int64_t expected_size = HEADER_SIZE + (int64_t)header->row_count * record_size;
+    return (int64_t)file_size >= expected_size;
+}
+
+/* "dir/users.tbl" → "users". .tbl 로 끝나지 않거나 이름이 너무 길면 false */
+static bool extract_table_name(const char *path, char out_name[MAX_NAME])
+{
+    const char *slash = strrchr(path, '/');
+    const char *base = slash == NULL ? path : slash + 1;
+    size_t base_len = strlen(base);
+    size_t ext_len = strlen(TABLE_FILE_EXT);
+    if (base_len <= ext_len || strcmp(base + base_len - ext_len, TABLE_FILE_EXT) != 0)
+        return false;
+    size_t name_len = base_len - ext_len;
+    if (name_len >= MAX_NAME)
+        return false;
+    memcpy(out_name, base, name_len);
+    out_name[name_len] = '\0';
+    return true;
+}
+
+/* 열린 fd 에서 헤더를 읽어 검사한다 */
+static ErrorCode load_header(int fd, TableHeader *out_header)
+{
+    struct stat info;
+    if (fstat(fd, &info) != 0)
+        return ERR_IO;
+    if (info.st_size < HEADER_SIZE)
+        return ERR_CORRUPT;
+    uint8_t bytes[HEADER_SIZE];
+    if (!read_all_at(fd, bytes, HEADER_SIZE, 0))
+        return ERR_IO;
+    table_header_decode(bytes, out_header);
+    return is_valid_header(out_header, info.st_size) ? ERR_NONE : ERR_CORRUPT;
+}
+
+Table *table_open(const char *path, ErrorCode *out_error)
+{
+    Table *table = calloc(1, sizeof(*table));
+    if (table == NULL) {
+        *out_error = ERR_INTERNAL;
+        return NULL;
+    }
+    table->fd = -1;
+    ErrorCode error = extract_table_name(path, table->name) ? ERR_NONE : ERR_CORRUPT;
+    if (error == ERR_NONE) {
+        table->fd = open(path, O_RDWR);
+        error = table->fd < 0 ? ERR_IO : ERR_NONE;
+    }
+    if (error == ERR_NONE)
+        error = load_header(table->fd, &table->header);
+    if (error != ERR_NONE)
+        goto cleanup;
+    *out_error = ERR_NONE;
+    return table;
+
+cleanup:
+    table_close(table);
+    *out_error = error;
+    return NULL;
+}
+
+void table_close(Table *table)
+{
+    if (table == NULL)
+        return;
+    if (table->fd >= 0)
+        close(table->fd);
+    free(table);
+}
+
+const char *table_name(const Table *table)
+{
+    return table->name;
+}
+
+int table_column_count(const Table *table)
+{
+    return table->header.column_count;
+}
+
+const ColumnDef *table_column(const Table *table, int index)
+{
+    return &table->header.columns[index];
+}
+
+bool table_find_column(const Table *table, const char *name, int *out_index)
+{
+    for (int i = 0; i < table->header.column_count; i++) {
+        if (strcmp(table->header.columns[i].name, name) == 0) {
+            *out_index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t table_record_count(const Table *table)
+{
+    return table->header.row_count;
 }
