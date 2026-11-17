@@ -63,6 +63,8 @@ const char *table_name(const Table *table);
 int table_column_count(const Table *table);
 /* index 번째 컬럼 정의 (0 <= index < table_column_count) */
 const ColumnDef *table_column(const Table *table, int index);
+/* index 번째 컬럼이 레코드 안에서 시작하는 바이트 위치 */
+int32_t table_column_offset(const Table *table, int index);
 /* 이름이 정확히 같은 컬럼을 찾는다 (이름은 파서가 소문자로 정규화한다). 없으면 false */
 bool table_find_column(const Table *table, const char *name, int *out_index);
 int32_t table_record_count(const Table *table);

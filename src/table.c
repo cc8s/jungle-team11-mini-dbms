@@ -322,6 +322,11 @@ const ColumnDef *table_column(const Table *table, int index)
     return &table->header.columns[index];
 }
 
+int32_t table_column_offset(const Table *table, int index)
+{
+    return table->column_offsets[index];
+}
+
 bool table_find_column(const Table *table, const char *name, int *out_index)
 {
     for (int i = 0; i < table->header.column_count; i++) {
