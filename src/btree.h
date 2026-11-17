@@ -18,6 +18,7 @@ _Static_assert(BTREE_ORDER >= 3, "BTREE_ORDER must be at least 3");
 
 #define BTREE_OK 0         /* btree_insert 성공 */
 #define BTREE_DUPLICATE -1 /* 이미 있는 키라서 삽입하지 않음 */
+#define BTREE_NO_MEMORY -2 /* 노드 할당 실패, 트리는 삽입 전 그대로 */
 
 typedef struct BTree BTree;
 
@@ -28,7 +29,7 @@ BTree *btree_create(void);
 void btree_destroy(BTree *tree);
 
 /* key → value 를 등록한다. 성공하면 BTREE_OK, 이미 있는 키면 BTREE_DUPLICATE 이고
- * 트리는 바뀌지 않는다 (기존 값 유지). */
+ * 트리는 바뀌지 않는다 (기존 값 유지). 메모리가 모자라면 BTREE_NO_MEMORY. */
 int btree_insert(BTree *tree, int32_t key, uint64_t value);
 
 /* key 를 찾으면 *out_value 에 값을 쓰고 true. 없으면 false 이고 *out_value 는 건드리지 않는다 */

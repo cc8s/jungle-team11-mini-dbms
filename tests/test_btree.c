@@ -170,6 +170,209 @@ static void test_fill_leaf_without_split(void)
     btree_destroy(tree);
 }
 
+/* ---- S21 리프 split ---- */
+
+/* 리프 split 때 왼쪽 리프에 남는 키 개수: ⌈(ORDER-1)/2⌉. 나머지 ORDER - 이 값은 오른쪽 */
+#define SPLIT_LEFT_COUNT ((BTREE_MAX_KEYS + 1) / 2)
+#define SPLIT_RIGHT_COUNT (BTREE_ORDER - SPLIT_LEFT_COUNT)
+#define KEY_GAP 10 /* 키 사이에 빈자리를 두어 나중에 사이 키를 끼워 넣는다 */
+
+static const BNode *leftmost_leaf(const BTree *tree)
+{
+    const BNode *node = tree->root;
+    while (!node->is_leaf)
+        node = node->children[0];
+    return node;
+}
+
+static int count_leaves(const BTree *tree)
+{
+    int count = 0;
+    for (const BNode *leaf = leftmost_leaf(tree); leaf != NULL; leaf = leaf->next)
+        count++;
+    return count;
+}
+
+/* 가장 왼쪽 리프부터 next 를 따라가며 키가 엄격한 오름차순이고 개수가 size 와 같은지 */
+static bool is_leaf_chain_sorted(const BTree *tree)
+{
+    int64_t count = 0;
+    bool has_previous = false;
+    int32_t previous = 0;
+    for (const BNode *leaf = leftmost_leaf(tree); leaf != NULL; leaf = leaf->next) {
+        for (int i = 0; i < leaf->num_keys; i++) {
+            if (has_previous && previous >= leaf->keys[i])
+                return false;
+            previous = leaf->keys[i];
+            has_previous = true;
+            count++;
+        }
+    }
+    return count == btree_size(tree);
+}
+
+/* 첫 split 직후 모양: 루트는 키 1 개짜리 내부 노드, 루트 키 = 오른쪽 리프 첫 키 */
+static void check_first_split_shape(const BTree *tree)
+{
+    const BNode *root = tree->root;
+    CHECK(btree_height(tree) == 2);
+    CHECK(!root->is_leaf);
+    CHECK(root->num_keys == 1);
+    CHECK(root->keys[0] == root->children[1]->keys[0]);
+    CHECK(root->children[0]->next == root->children[1]);
+    CHECK(root->children[1]->next == NULL);
+    CHECK(is_leaf_chain_sorted(tree));
+}
+
+static void check_all_found(const BTree *tree, int32_t first, int32_t last, int32_t step)
+{
+    for (int32_t key = first; key <= last; key += step) {
+        uint64_t value = SENTINEL_VALUE;
+        CHECK(btree_search(tree, key, &value));
+        CHECK(value == (uint64_t)key);
+    }
+}
+
+/* 2, 4, ..., 2 × MAX_KEYS 로 리프를 꽉 채운다 (홀수 자리는 비어 있음) */
+static BTree *create_full_even_leaf(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t i = 1; i <= BTREE_MAX_KEYS; i++)
+        CHECK(btree_insert(tree, 2 * i, (uint64_t)(2 * i)) == BTREE_OK);
+    CHECK(btree_height(tree) == 1);
+    return tree;
+}
+
+/* T21-01 */
+static void test_first_split_grows_height(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t key = 1; key <= BTREE_ORDER; key++)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    CHECK(btree_height(tree) == 2);
+    CHECK(btree_size(tree) == BTREE_ORDER);
+    check_all_found(tree, 1, BTREE_ORDER, 1);
+    btree_destroy(tree);
+}
+
+/* T21-02 */
+static void test_first_split_root_key(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t key = 1; key <= BTREE_ORDER; key++)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    check_first_split_shape(tree);
+    CHECK(tree->root->keys[0] == SPLIT_LEFT_COUNT + 1);
+    btree_destroy(tree);
+}
+
+/* T21-03 */
+static void test_leaf_chain_is_sorted(void)
+{
+    BTree *tree = create_tree();
+    /* 3 의 배수 보폭으로 뒤섞어 여러 리프에 흩뿌린다 (1 ~ 3×ORDER 를 한 번씩) */
+    const int32_t key_count = 3 * BTREE_ORDER;
+    for (int32_t i = 0; i < key_count; i++) {
+        int32_t key = (int32_t)((i * 7) % key_count) + 1;
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    }
+    CHECK(count_leaves(tree) >= 2);
+    CHECK(is_leaf_chain_sorted(tree));
+    check_all_found(tree, 1, key_count, 1);
+    btree_destroy(tree);
+}
+
+/* T21-04 */
+static void test_split_key_counts(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t key = 1; key <= BTREE_ORDER; key++)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    CHECK(tree->root->children[0]->num_keys == SPLIT_LEFT_COUNT);
+    CHECK(tree->root->children[1]->num_keys == SPLIT_RIGHT_COUNT);
+    btree_destroy(tree);
+}
+
+/* E21-01 */
+static void test_split_new_key_in_left_half(void)
+{
+    BTree *tree = create_full_even_leaf();
+    CHECK(btree_insert(tree, 3, 3) == BTREE_OK); /* 2 와 4 사이: 왼쪽 절반 */
+    check_first_split_shape(tree);
+    CHECK(tree->root->children[0]->keys[1] == 3);
+    CHECK(tree->root->children[0]->num_keys == SPLIT_LEFT_COUNT);
+    check_all_found(tree, 2, 2 * BTREE_MAX_KEYS, 2);
+    btree_destroy(tree);
+}
+
+/* E21-02 */
+static void test_split_new_key_at_right_front(void)
+{
+    BTree *tree = create_full_even_leaf();
+    /* 합친 배열의 SPLIT_LEFT_COUNT 번째 자리 = 오른쪽 리프의 맨 앞 */
+    const int32_t new_key = 2 * SPLIT_LEFT_COUNT + 1;
+    CHECK(btree_insert(tree, new_key, (uint64_t)new_key) == BTREE_OK);
+    check_first_split_shape(tree);
+    CHECK(tree->root->keys[0] == new_key);
+    CHECK(tree->root->children[1]->keys[0] == new_key);
+    btree_destroy(tree);
+}
+
+/* E21-03 */
+static void test_split_ascending_leaves_left_half_full(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t key = 1; key <= BTREE_ORDER; key++)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    check_first_split_shape(tree);
+    const BNode *left = tree->root->children[0];
+    const BNode *right = tree->root->children[1];
+    CHECK(left->num_keys == SPLIT_LEFT_COUNT); /* 꽉 차지 않고 반만 참 */
+    CHECK(left->keys[left->num_keys - 1] == SPLIT_LEFT_COUNT);
+    CHECK(right->keys[right->num_keys - 1] == BTREE_ORDER);
+    btree_destroy(tree);
+}
+
+/* E21-04 */
+static void test_split_descending(void)
+{
+    BTree *tree = create_tree();
+    for (int32_t key = BTREE_ORDER; key >= 1; key--)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+    check_first_split_shape(tree);
+    CHECK(leftmost_leaf(tree)->keys[0] == 1);
+    check_all_found(tree, 1, BTREE_ORDER, 1);
+    btree_destroy(tree);
+}
+
+/* E21-05 */
+static void test_split_middle_leaf_keeps_chain(void)
+{
+    BTree *tree = create_tree();
+    /* 오름차순으로 리프 3 개 (왼쪽, 가운데, 오른쪽) 가 될 때까지 넣는다 */
+    int32_t last_key = 0;
+    while (count_leaves(tree) < 3) {
+        last_key += KEY_GAP;
+        CHECK(btree_insert(tree, last_key, (uint64_t)last_key) == BTREE_OK);
+    }
+    const BNode *middle = leftmost_leaf(tree)->next;
+    const BNode *right = middle->next;
+    int32_t middle_first = middle->keys[0];
+
+    /* 가운데 리프의 키 사이 빈자리를 채워 가운데 리프만 split 시킨다. 빈자리마다 두 개씩
+     * (끝자리 1, 6) 넣어야 ORDER 가 홀수여서 split 에 키가 하나 더 필요할 때도 오른쪽 리프로 넘치지 않는다 */
+    for (int32_t key = middle_first + 1; count_leaves(tree) < 4; key += KEY_GAP / 2)
+        CHECK(btree_insert(tree, key, (uint64_t)key) == BTREE_OK);
+
+    CHECK(btree_height(tree) == 2);
+    CHECK(middle->next != right); /* 새 리프가 가운데와 오른쪽 사이에 들어감 */
+    CHECK(middle->next->next == right);
+    CHECK(right->next == NULL);
+    CHECK(is_leaf_chain_sorted(tree));
+    check_all_found(tree, KEY_GAP, last_key, KEY_GAP);
+    btree_destroy(tree);
+}
+
 int main(void)
 {
     printf("test_btree\n");
@@ -183,6 +386,15 @@ int main(void)
     RUN(test_extreme_keys);
     RUN(test_destroy_null);
     RUN(test_fill_leaf_without_split);
+    RUN(test_first_split_grows_height);
+    RUN(test_first_split_root_key);
+    RUN(test_leaf_chain_is_sorted);
+    RUN(test_split_key_counts);
+    RUN(test_split_new_key_in_left_half);
+    RUN(test_split_new_key_at_right_front);
+    RUN(test_split_ascending_leaves_left_half_full);
+    RUN(test_split_descending);
+    RUN(test_split_middle_leaf_keeps_chain);
     TEST_DONE();
     return 0;
 }
