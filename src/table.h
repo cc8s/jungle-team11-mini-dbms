@@ -121,6 +121,11 @@ ErrorCode table_read_record(const Table *table, int32_t id, uint8_t *out_record)
 ErrorCode table_read_records(const Table *table, int32_t first_id, int32_t count,
                              uint8_t *out_records);
 
+/* 인덱스가 돌려준 레코드 offset 에서 count 개를 한 번의 pread 로 읽는다 (연속 offset 묶음 읽기).
+ * offset 이 레코드 경계가 아니거나 범위가 1 ~ row_count 밖이면 ERR_INTERNAL */
+ErrorCode table_read_records_at(const Table *table, uint64_t offset, int32_t count,
+                                uint8_t *out_records);
+
 /* record 의 column 번째 INT 값 */
 int32_t table_record_int(const Table *table, const uint8_t *record, int column);
 /* record 의 column 번째 VARCHAR 값. \0 으로 끝나지 않을 수 있으니 *out_len 만큼만 읽는다.

@@ -233,7 +233,7 @@ static Result select_ok(Engine *engine, const char *sql)
 {
     Result result = engine_execute(engine, sql, NULL, 0);
     CHECK(result.error == ERR_NONE);
-    CHECK(!result.used_index);
+    /* used_index 는 보지 않는다: Phase 2 부터 id 조건은 인덱스 경로 (test_index.c 에서 검사) */
     return result;
 }
 

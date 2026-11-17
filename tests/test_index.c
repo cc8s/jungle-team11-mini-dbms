@@ -491,6 +491,223 @@ static void test_two_tables_keep_own_index(void)
     test_db_destroy(&db);
 }
 
+/* ---- S27 SELECT 접근 경로 ---- */
+
+#define ACCESS_ROW_COUNT 100
+#define MULTI_LEAF_ROW_COUNT 1000
+#define SQL_BUFFER_SIZE 256
+#define ID_COLUMN 0
+#define NAME_COLUMN 1
+
+/* name = 'user<i>' 로 count 건을 넣은 DB (엔진 열린 상태) */
+static TestDb open_named_users(int count)
+{
+    TestDb db = open_db();
+    for (int i = 1; i <= count; i++) {
+        char sql[SQL_BUFFER_SIZE];
+        snprintf(sql, sizeof(sql), "INSERT INTO users VALUES ('user%d', %d)", i, i % 50);
+        Result result = engine_execute(db.engine, sql, NULL, 0);
+        CHECK(result.error == ERR_NONE);
+        result_free(&result);
+    }
+    return db;
+}
+
+static Result select_ok(Engine *engine, const char *sql)
+{
+    Result result = engine_execute(engine, sql, NULL, 0);
+    CHECK(result.error == ERR_NONE);
+    return result;
+}
+
+/* sql 의 결과가 first_id 부터 연속인 row_count 행이고, 인덱스 사용 여부가 기대와 같은지 */
+static void check_select_ids(Engine *engine, const char *sql, int64_t row_count,
+                             int32_t first_id, bool used_index)
+{
+    Result result = select_ok(engine, sql);
+    CHECK(result.row_count == row_count);
+    CHECK(result.used_index == used_index);
+    for (int64_t row = 0; row < result.row_count; row++)
+        CHECK(result_get_int(&result, row, ID_COLUMN) == first_id + (int32_t)row);
+    result_free(&result);
+}
+
+/* 테스트용으로 인덱스를 끄고 실행한다: 인덱스가 없는 테이블은 선형 탐색으로 간다 */
+static Result select_without_index(Engine *engine, const char *sql)
+{
+    Table *table = (Table *)find_users(engine); /* 테스트에서만 const 를 푼다 */
+    BTree *saved = table->index;
+    table->index = NULL;
+    Result result = select_ok(engine, sql);
+    table->index = saved;
+    return result;
+}
+
+/* T27-01 */
+static void test_select_id_equal_uses_index(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id = 50", 1, 50, true);
+    Result result = select_ok(db.engine, "SELECT * FROM users WHERE id = 50");
+    size_t len = 0;
+    const char *name = result_get_str(&result, 0, NAME_COLUMN, &len);
+    CHECK(len == strlen("user50") && memcmp(name, "user50", len) == 0);
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* T27-02 */
+static void test_select_id_greater_equal(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id >= 95", 6, 95, true);
+    test_db_destroy(&db);
+}
+
+/* T27-03 */
+static void test_select_id_less_than(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id < 3", 2, 1, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id <= 3", 3, 1, true);
+    test_db_destroy(&db);
+}
+
+/* T27-04 */
+static void test_select_other_column_scans(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE name = 'user50'", 1, 50, false);
+    check_select_ids(db.engine, "SELECT * FROM users", ACCESS_ROW_COUNT, 1, false);
+    test_db_destroy(&db);
+}
+
+/* T27-05 */
+static void test_index_and_scan_give_same_rows(void)
+{
+    const char *queries[] = {
+        "SELECT * FROM users WHERE id = 50",       "SELECT * FROM users WHERE id >= 95",
+        "SELECT * FROM users WHERE id > 95",       "SELECT * FROM users WHERE id < 3",
+        "SELECT * FROM users WHERE id <= 7",       "SELECT * FROM users WHERE id > 10 LIMIT 5",
+        "SELECT name FROM users WHERE id >= 40 LIMIT 3", "SELECT * FROM users WHERE id = 101",
+    };
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        Result indexed = select_ok(db.engine, queries[i]);
+        Result scanned = select_without_index(db.engine, queries[i]);
+        CHECK(indexed.used_index && !scanned.used_index);
+        CHECK(indexed.row_count == scanned.row_count);
+        CHECK(indexed.record_size == scanned.record_size);
+        CHECK(indexed.column_count == scanned.column_count);
+        size_t bytes = (size_t)indexed.row_count * (size_t)indexed.record_size;
+        CHECK(bytes == 0 || memcmp(indexed.rows, scanned.rows, bytes) == 0);
+        result_free(&indexed);
+        result_free(&scanned);
+    }
+    test_db_destroy(&db);
+}
+
+/* T27-06 */
+static void test_select_id_range_with_limit(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id > 10 LIMIT 5", 5, 11, true);
+    test_db_destroy(&db);
+}
+
+/* E27-01 */
+static void test_select_id_not_equal_scans(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    Result result = select_ok(db.engine, "SELECT * FROM users WHERE id != 50");
+    CHECK(result.row_count == ACCESS_ROW_COUNT - 1);
+    CHECK(!result.used_index);
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* E27-02 */
+static void test_select_missing_id_is_empty(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id = 0", 0, 0, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id = -5", 0, 0, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id = 101", 0, 0, true);
+    test_db_destroy(&db);
+}
+
+/* E27-03 */
+static void test_select_range_outside_ids(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id > 100", 0, 0, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id < 1", 0, 0, true);
+    test_db_destroy(&db);
+}
+
+/* E27-04 */
+static void test_select_extreme_bounds(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id >= -2147483648", ACCESS_ROW_COUNT,
+                     1, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id <= 2147483647", ACCESS_ROW_COUNT, 1,
+                     true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id < -2147483648", 0, 0, true);
+    test_db_destroy(&db);
+}
+
+/* E27-05 */
+static void test_select_greater_than_max(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id > 2147483647", 0, 0, true);
+    test_db_destroy(&db);
+}
+
+/* E27-06 */
+static void test_select_empty_table_by_id(void)
+{
+    TestDb db = open_db();
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id = 1", 0, 0, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id >= 1", 0, 0, true);
+    test_db_destroy(&db);
+}
+
+/* E27-07 */
+static void test_select_range_across_leaves(void)
+{
+    TestDb db = open_named_users(MULTI_LEAF_ROW_COUNT);
+    CHECK(btree_height(table_index(find_users(db.engine))) >= 2); /* 리프가 여러 개 */
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id >= 2", MULTI_LEAF_ROW_COUNT - 1, 2,
+                     true);
+    test_db_destroy(&db);
+}
+
+/* E27-08 */
+static void test_select_id_with_limit_zero(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id = 50 LIMIT 0", 0, 0, true);
+    check_select_ids(db.engine, "SELECT * FROM users WHERE id >= 1 LIMIT 0", 0, 0, true);
+    test_db_destroy(&db);
+}
+
+/* E27-09 */
+static void test_select_name_by_id(void)
+{
+    TestDb db = open_named_users(ACCESS_ROW_COUNT);
+    Result result = select_ok(db.engine, "SELECT name FROM users WHERE id = 50");
+    CHECK(result.used_index);
+    CHECK(result.row_count == 1);
+    CHECK(result.column_count == 1);
+    size_t len = 0;
+    const char *name = result_get_str(&result, 0, 0, &len);
+    CHECK(len == strlen("user50") && memcmp(name, "user50", len) == 0);
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     printf("test_index\n");
@@ -513,6 +730,21 @@ int main(void)
     RUN(test_write_failure_keeps_index);
     RUN(test_tree_failure_recovered_by_rebuild);
     RUN(test_two_tables_keep_own_index);
+    RUN(test_select_id_equal_uses_index);
+    RUN(test_select_id_greater_equal);
+    RUN(test_select_id_less_than);
+    RUN(test_select_other_column_scans);
+    RUN(test_index_and_scan_give_same_rows);
+    RUN(test_select_id_range_with_limit);
+    RUN(test_select_id_not_equal_scans);
+    RUN(test_select_missing_id_is_empty);
+    RUN(test_select_range_outside_ids);
+    RUN(test_select_extreme_bounds);
+    RUN(test_select_greater_than_max);
+    RUN(test_select_empty_table_by_id);
+    RUN(test_select_range_across_leaves);
+    RUN(test_select_id_with_limit_zero);
+    RUN(test_select_name_by_id);
     TEST_DONE();
     return 0;
 }

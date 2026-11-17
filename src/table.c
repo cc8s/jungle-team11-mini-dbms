@@ -467,6 +467,19 @@ ErrorCode table_read_records(const Table *table, int32_t first_id, int32_t count
     return ERR_NONE;
 }
 
+/* offset → id 는 record_offset 의 역산이다. 공식이 이 파일에만 있도록 여기서 되돌린다 */
+ErrorCode table_read_records_at(const Table *table, uint64_t offset, int32_t count,
+                                uint8_t *out_records)
+{
+    uint64_t record_size = (uint64_t)table->header.record_size;
+    if (offset < HEADER_SIZE || (offset - HEADER_SIZE) % record_size != 0)
+        return ERR_INTERNAL;
+    uint64_t index = (offset - HEADER_SIZE) / record_size;
+    if (index >= (uint64_t)table->header.row_count)
+        return ERR_INTERNAL;
+    return table_read_records(table, (int32_t)index + 1, count, out_records);
+}
+
 ErrorCode table_read_record(const Table *table, int32_t id, uint8_t *out_record)
 {
     return table_read_records(table, id, 1, out_record);
