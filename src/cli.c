@@ -87,10 +87,12 @@ static char *read_text_file(const char *path, size_t *out_len, FILE *err)
 {
     char *text = NULL;
     struct stat info;
+    char reason[MAX_MESSAGE];
     int fd = open(path, O_RDONLY);
     if (fd < 0 || fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+        /* strerror 는 내부 버퍼를 공유해 재진입이 안 되므로 GNU strerror_r 을 쓴다 */
         fprintf(err, "minidb: cannot read '%s': %s\n", path,
-                fd < 0 ? strerror(errno) : "not a regular file");
+                fd < 0 ? strerror_r(errno, reason, sizeof(reason)) : "not a regular file");
         goto cleanup;
     }
     text = malloc((size_t)info.st_size + 1);
