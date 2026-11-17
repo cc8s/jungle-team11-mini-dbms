@@ -23,6 +23,7 @@ struct Parser {
     size_t token_count;
     size_t token_capacity;
     size_t pos;
+    int statement_number; /* 꺼낸 문장 수 (빈 문장 제외) */
 
     ErrorCode error;
     int error_line;
@@ -556,14 +557,47 @@ static ErrorCode parse_tokens(Parser *parser, Statement *stmt)
     return fail_at(parser, ERR_SYNTAX, first, "expected a statement");
 }
 
-ErrorCode parser_parse_statement(Parser *parser, Statement *out_stmt)
+static void clear_error(Parser *parser)
 {
-    memset(out_stmt, 0, sizeof(*out_stmt));
     parser->error = ERR_NONE;
     parser->error_line = 0;
     parser->message[0] = '\0';
+}
 
-    ErrorCode error = collect_statement_tokens(parser);
+/* 토큰이 ; 또는 EOF 하나뿐인 문장. 토크나이저 에러가 난 문장은 비어 보여도 에러 문장이다 */
+static bool is_empty_statement(const Parser *parser, ErrorCode collect_error)
+{
+    return collect_error == ERR_NONE && parser->token_count == 1;
+}
+
+static bool is_end_of_input(const Parser *parser)
+{
+    return parser->tokens[parser->token_count - 1].type == TOK_EOF;
+}
+
+/* 빈 문장을 건너뛰며 다음 문장의 토큰을 모은다. 입력이 끝났으면 false */
+static bool collect_next_statement(Parser *parser, ErrorCode *out_error)
+{
+    for (;;) {
+        clear_error(parser);
+        ErrorCode error = collect_statement_tokens(parser);
+        if (!is_empty_statement(parser, error)) {
+            *out_error = error;
+            return true;
+        }
+        if (is_end_of_input(parser))
+            return false;
+    }
+}
+
+bool parser_next_statement(Parser *parser, Statement *out_stmt, ErrorCode *out_error)
+{
+    memset(out_stmt, 0, sizeof(*out_stmt));
+    ErrorCode error = ERR_NONE;
+    if (!collect_next_statement(parser, &error))
+        return false;
+
+    parser->statement_number++;
     if (error == ERR_NONE)
         error = parse_tokens(parser, out_stmt);
     if (error != ERR_NONE) {
@@ -571,5 +605,50 @@ ErrorCode parser_parse_statement(Parser *parser, Statement *out_stmt)
         statement_free(out_stmt);
         memset(out_stmt, 0, sizeof(*out_stmt));
     }
+    *out_error = error;
+    return true;
+}
+
+/* 첫 문장을 파싱하고, 뒤에 남은 것이 빈 문장뿐인지 본다.
+ * 무엇이든 더 있으면 (토크나이저 에러여도) 두 번째 문장으로 보고 거절한다 */
+static ErrorCode parse_only_statement(Parser *parser, Statement *out_stmt)
+{
+    ErrorCode error = ERR_NONE;
+    if (!parser_next_statement(parser, out_stmt, &error))
+        return fail_at(parser, ERR_SYNTAX, current(parser), "expected a statement");
+    if (error != ERR_NONE)
+        return error;
+
+    ErrorCode rest_error = ERR_NONE;
+    if (!collect_next_statement(parser, &rest_error))
+        return ERR_NONE;
+    statement_free(out_stmt);
+    memset(out_stmt, 0, sizeof(*out_stmt));
+    return fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                   "only one statement is allowed here");
+}
+
+ErrorCode parser_parse_single(const char *sql, size_t len, Statement *out_stmt,
+                              ParseError *out_error)
+{
+    memset(out_stmt, 0, sizeof(*out_stmt));
+    memset(out_error, 0, sizeof(*out_error));
+    Parser *parser = parser_create(sql, len);
+    if (parser == NULL) {
+        snprintf(out_error->message, sizeof(out_error->message), "out of memory");
+        return ERR_INTERNAL;
+    }
+    /* Parser 를 해제하기 전에 에러 정보를 호출한 쪽 버퍼로 옮겨 둔다 */
+    ErrorCode error = parse_only_statement(parser, out_stmt);
+    if (error != ERR_NONE) {
+        out_error->line = parser->error_line;
+        snprintf(out_error->message, sizeof(out_error->message), "%s", parser->message);
+    }
+    parser_destroy(parser);
     return error;
+}
+
+int parser_statement_number(const Parser *parser)
+{
+    return parser->statement_number;
 }

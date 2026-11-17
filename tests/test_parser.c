@@ -5,11 +5,8 @@
 /* 문장 하나를 파싱하고 에러 코드를 돌려준다. 성공했으면 호출한 쪽이 statement_free 한다 */
 static ErrorCode parse_one(const char *sql, Statement *out_stmt)
 {
-    Parser *parser = parser_create(sql, strlen(sql));
-    CHECK(parser != NULL);
-    ErrorCode error = parser_parse_statement(parser, out_stmt);
-    parser_destroy(parser);
-    return error;
+    ParseError error_info;
+    return parser_parse_single(sql, strlen(sql), out_stmt, &error_info);
 }
 
 static ErrorCode parse_error(const char *sql)
@@ -105,15 +102,13 @@ static void test_select_with_semicolon_and_line(void)
 /* E05-05 */ static void test_select_from_typo_reports_token_and_line(void)
 {
     const char *sql = "SELECT *\n\nFORM users";
-    Parser *parser = parser_create(sql, strlen(sql));
-    CHECK(parser != NULL);
     Statement stmt;
+    ParseError error;
 
-    CHECK(parser_parse_statement(parser, &stmt) == ERR_SYNTAX);
-    CHECK(parser_error_line(parser) == 3);
-    CHECK(strstr(parser_error_message(parser), "FORM") != NULL); /* 문제 토큰을 원문대로 보여준다 */
+    CHECK(parser_parse_single(sql, strlen(sql), &stmt, &error) == ERR_SYNTAX);
+    CHECK(error.line == 3);
+    CHECK(strstr(error.message, "FORM") != NULL); /* 문제 토큰을 원문대로 보여준다 */
     statement_free(&stmt);
-    parser_destroy(parser);
 }
 
 /* E05-06 */ static void test_select_keyword_as_table(void)
@@ -570,6 +565,244 @@ static void test_create_extra_token_after_columns(void)
     CHECK(parse_error("CREATE TABLE t (id INT, select INT)") == ERR_SYNTAX);
 }
 
+/* ---- S09: 스크립트, 에러 복구 ---- */
+
+#define MAX_SCRIPT_STATEMENTS 128
+#define ERROR_STATEMENT_COUNT 100
+
+/* 스크립트를 끝까지 돌며 문장마다 결과를 모은다 */
+typedef struct {
+    int count;
+    ErrorCode errors[MAX_SCRIPT_STATEMENTS];
+    int numbers[MAX_SCRIPT_STATEMENTS];
+    int lines[MAX_SCRIPT_STATEMENTS];
+    char tables[MAX_SCRIPT_STATEMENTS][MAX_NAME];
+} ScriptRun;
+
+static void record_statement(ScriptRun *run, const Parser *parser, const Statement *stmt,
+                             ErrorCode error)
+{
+    int i = run->count++;
+    run->errors[i] = error;
+    run->numbers[i] = parser_statement_number(parser);
+    run->lines[i] = error == ERR_NONE ? stmt->line : parser_error_line(parser);
+    run->tables[i][0] = '\0';
+    if (error == ERR_NONE && stmt->type == STMT_SELECT)
+        snprintf(run->tables[i], MAX_NAME, "%s", stmt->select.table);
+}
+
+static ScriptRun run_script(const char *sql)
+{
+    ScriptRun run = {0};
+    Parser *parser = parser_create(sql, strlen(sql));
+    CHECK(parser != NULL);
+    Statement stmt;
+    ErrorCode error;
+    while (run.count < MAX_SCRIPT_STATEMENTS && parser_next_statement(parser, &stmt, &error)) {
+        record_statement(&run, parser, &stmt, error);
+        statement_free(&stmt);
+    }
+    parser_destroy(parser);
+    return run;
+}
+
+/* SELECT * FROM a WHERE name = 'xxx…' 를 첫 토큰부터 마지막 ' 까지 정확히 size 바이트로 만들고 suffix 를 붙인다 */
+static char *make_sized_statement(size_t size, const char *suffix)
+{
+    const char *prefix = "SELECT * FROM a WHERE name = '";
+    size_t prefix_len = strlen(prefix);
+    size_t body_len = size - prefix_len - 1;
+    char *sql = malloc(size + strlen(suffix) + 1);
+    CHECK(sql != NULL);
+    memcpy(sql, prefix, prefix_len);
+    memset(sql + prefix_len, 'x', body_len);
+    sql[prefix_len + body_len] = '\'';
+    strcpy(sql + size, suffix);
+    return sql;
+}
+
+/* T09-01 */ static void test_script_two_statements(void)
+{
+    ScriptRun run = run_script("SELECT * FROM a; SELECT * FROM b;");
+    CHECK(run.count == 2);
+    CHECK(run.errors[0] == ERR_NONE && run.errors[1] == ERR_NONE);
+    CHECK(run.numbers[0] == 1 && run.numbers[1] == 2);
+    CHECK_STR_EQ(run.tables[0], "a");
+    CHECK_STR_EQ(run.tables[1], "b");
+}
+
+/* T09-02 */ static void test_script_last_semicolon_optional(void)
+{
+    ScriptRun run = run_script("SELECT * FROM a; SELECT * FROM b");
+    CHECK(run.count == 2);
+    CHECK(run.errors[1] == ERR_NONE);
+    CHECK_STR_EQ(run.tables[1], "b");
+}
+
+/* T09-03 */ static void test_script_continues_after_error(void)
+{
+    ScriptRun run = run_script("SELEC x; SELECT * FROM b;");
+    CHECK(run.count == 2);
+    CHECK(run.errors[0] == ERR_SYNTAX);
+    CHECK(run.errors[1] == ERR_NONE);
+    CHECK(run.numbers[0] == 1 && run.numbers[1] == 2); /* 에러 문장도 번호를 받는다 */
+    CHECK_STR_EQ(run.tables[1], "b");
+}
+
+/* T09-04 */ static void test_script_statement_start_line(void)
+{
+    ScriptRun run = run_script("\n\nSELECT * FROM a;\nSELECT *\nFROM b;");
+    CHECK(run.count == 2);
+    CHECK(run.lines[0] == 3);
+    CHECK(run.lines[1] == 4);
+}
+
+static void test_script_error_line(void)
+{
+    ScriptRun run = run_script("SELECT * FROM a;\nSELECT *\nFORM b;");
+    CHECK(run.count == 2);
+    CHECK(run.errors[1] == ERR_SYNTAX);
+    CHECK(run.numbers[1] == 2);
+    CHECK(run.lines[1] == 3); /* 에러는 문제 토큰의 줄 */
+}
+
+/* T09-05 */ static void test_single_statement_mode(void)
+{
+    Statement stmt;
+    CHECK(parse_one("SELECT * FROM a;", &stmt) == ERR_NONE);
+    CHECK_STR_EQ(stmt.select.table, "a");
+    statement_free(&stmt);
+}
+
+/* E09-01 */ static void test_script_empty(void)
+{
+    CHECK(run_script("").count == 0);
+    CHECK(run_script("  \n\t ").count == 0);
+}
+
+/* E09-02 */ static void test_script_only_comment(void)
+{
+    CHECK(run_script("-- only comment").count == 0);
+}
+
+/* E09-03 */ static void test_script_only_semicolons(void)
+{
+    CHECK(run_script(";;;").count == 0);
+    CHECK(run_script("; -- c\n ;").count == 0);
+}
+
+/* E09-04 */ static void test_script_empty_statement_between(void)
+{
+    ScriptRun run = run_script("SELECT * FROM a;;SELECT * FROM b;");
+    CHECK(run.count == 2);
+    CHECK(run.numbers[0] == 1 && run.numbers[1] == 2); /* 빈 문장은 번호를 받지 않는다 */
+    CHECK(run.errors[0] == ERR_NONE && run.errors[1] == ERR_NONE);
+}
+
+/* E09-05 */ static void test_script_unterminated_string_swallows_rest(void)
+{
+    ScriptRun run = run_script("INSERT INTO t VALUES ('a); SELECT * FROM t;");
+    CHECK(run.count == 1);
+    CHECK(run.errors[0] == ERR_SYNTAX);
+}
+
+/* E09-06 */ static void test_script_too_large_then_normal(void)
+{
+    char *sql = make_sized_statement(MAX_SQL_LEN + 1, "; SELECT * FROM b;");
+    ScriptRun run = run_script(sql);
+    CHECK(run.count == 2);
+    CHECK(run.errors[0] == ERR_TOO_LARGE);
+    CHECK(run.errors[1] == ERR_NONE);
+    CHECK(run.numbers[1] == 2);
+    CHECK_STR_EQ(run.tables[1], "b");
+    free(sql);
+}
+
+/* E09-07 */ static void test_script_exact_max_statement(void)
+{
+    char *sql = make_sized_statement(MAX_SQL_LEN, ";");
+    ScriptRun run = run_script(sql);
+    CHECK(run.count == 1);
+    CHECK(run.errors[0] == ERR_NONE);
+    free(sql);
+}
+
+/* E09-08 */ static void test_single_mode_rejects_second_statement(void)
+{
+    CHECK(parse_error("SELECT * FROM a; SELECT * FROM b") == ERR_UNSUPPORTED);
+    CHECK(parse_error("SELECT * FROM a;; SELECT * FROM b;") == ERR_UNSUPPORTED);
+    CHECK(parse_error("SELECT * FROM a; @") == ERR_UNSUPPORTED);
+}
+
+/* E09-09 */ static void test_single_mode_allows_trailing_semicolon_and_comment(void)
+{
+    Statement stmt;
+    CHECK(parse_one("SELECT * FROM a; -- end", &stmt) == ERR_NONE);
+    statement_free(&stmt);
+    CHECK(parse_one("SELECT * FROM a;;\n", &stmt) == ERR_NONE);
+    statement_free(&stmt);
+}
+
+static void test_single_mode_reports_error_location(void)
+{
+    const char *sql = "SELECT * FROM a;\nSELECT * FROM b";
+    Statement stmt;
+    ParseError error;
+    CHECK(parser_parse_single(sql, strlen(sql), &stmt, &error) == ERR_UNSUPPORTED);
+    CHECK(error.line == 2); /* 두 번째 문장이 시작한 줄 */
+    CHECK(strstr(error.message, "SELECT") != NULL);
+    statement_free(&stmt);
+
+    sql = "SELECT * FROM a";
+    CHECK(parser_parse_single(sql, strlen(sql), &stmt, &error) == ERR_NONE);
+    CHECK(error.line == 0); /* 성공이면 에러 정보는 비어 있다 */
+    CHECK(error.message[0] == '\0');
+    statement_free(&stmt);
+}
+
+static void test_single_mode_needs_a_statement(void)
+{
+    CHECK(parse_error("") == ERR_SYNTAX);
+    CHECK(parse_error(";") == ERR_SYNTAX);
+    CHECK(parse_error("-- nothing") == ERR_SYNTAX);
+}
+
+/* E09-10 */ static void test_script_many_errors_do_not_leak(void)
+{
+    const char *bad = "INSERT INTO t VALUES ('leak', kim);\n";
+    size_t bad_len = strlen(bad);
+    char *sql = malloc(bad_len * ERROR_STATEMENT_COUNT + 1);
+    CHECK(sql != NULL);
+    for (int i = 0; i < ERROR_STATEMENT_COUNT; i++)
+        memcpy(sql + bad_len * i, bad, bad_len);
+    sql[bad_len * ERROR_STATEMENT_COUNT] = '\0';
+
+    ScriptRun run = run_script(sql);
+    CHECK(run.count == ERROR_STATEMENT_COUNT);
+    CHECK(run.errors[ERROR_STATEMENT_COUNT - 1] == ERR_SYNTAX);
+    CHECK(run.numbers[ERROR_STATEMENT_COUNT - 1] == ERROR_STATEMENT_COUNT);
+    CHECK(run.lines[ERROR_STATEMENT_COUNT - 1] == ERROR_STATEMENT_COUNT);
+    free(sql);
+}
+
+static void test_script_params_numbered_per_statement(void)
+{
+    const char *sql = "SELECT * FROM a WHERE id = ?; INSERT INTO a VALUES (?, ?)";
+    Parser *parser = parser_create(sql, strlen(sql));
+    CHECK(parser != NULL);
+    Statement stmt;
+    ErrorCode error;
+    CHECK(parser_next_statement(parser, &stmt, &error) && error == ERR_NONE);
+    statement_free(&stmt);
+    CHECK(parser_next_statement(parser, &stmt, &error) && error == ERR_NONE);
+    CHECK(stmt.param_count == 2);
+    CHECK(stmt.insert.values[0].param_index == 0);
+    statement_free(&stmt);
+    CHECK(!parser_next_statement(parser, &stmt, &error));
+    CHECK(!parser_next_statement(parser, &stmt, &error)); /* 끝에서는 계속 false */
+    parser_destroy(parser);
+}
+
 int main(void)
 {
     RUN(test_select_all);
@@ -644,6 +877,25 @@ int main(void)
     RUN(test_create_unsupported_type);
     RUN(test_create_without_table_keyword);
     RUN(test_create_extra_token_after_columns);
+    RUN(test_script_two_statements);
+    RUN(test_script_last_semicolon_optional);
+    RUN(test_script_continues_after_error);
+    RUN(test_script_statement_start_line);
+    RUN(test_script_error_line);
+    RUN(test_single_statement_mode);
+    RUN(test_script_empty);
+    RUN(test_script_only_comment);
+    RUN(test_script_only_semicolons);
+    RUN(test_script_empty_statement_between);
+    RUN(test_script_unterminated_string_swallows_rest);
+    RUN(test_script_too_large_then_normal);
+    RUN(test_script_exact_max_statement);
+    RUN(test_single_mode_rejects_second_statement);
+    RUN(test_single_mode_allows_trailing_semicolon_and_comment);
+    RUN(test_single_mode_reports_error_location);
+    RUN(test_single_mode_needs_a_statement);
+    RUN(test_script_many_errors_do_not_leak);
+    RUN(test_script_params_numbered_per_statement);
     TEST_DONE();
     return 0;
 }
