@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "engine.h"
+#include "parser.h"
+#include "table.h"
+
 #define TEST_PATH_MAX 4096
 #define TEST_TEMP_TEMPLATE "/tmp/minidb-test-XXXXXX"
 #define TEST_NFTW_OPEN_FDS 16 /* nftw 가 동시에 열어 둘 디렉터리 fd 수 */
@@ -46,21 +50,58 @@ static inline bool test_remove_dir(const char *path)
     return nftw(path, remove_visited_entry, TEST_NFTW_OPEN_FDS, FTW_DEPTH | FTW_PHYS) == 0;
 }
 
-/* 엔진 테스트용 데이터 디렉터리 묶음.
- * TODO(S14): engine 모듈이 생기면 Engine * 를 추가하고, create_sql 로 테이블을 만든 뒤 엔진을 연다. */
+/* 엔진 테스트용 데이터 디렉터리 묶음. create_sql 의 CREATE TABLE 들로 테이블을 만든 뒤 엔진을 연다. */
 typedef struct {
-    char *dir; /* 실패하면 NULL */
+    char *dir;      /* 실패하면 NULL */
+    Engine *engine; /* 실패하면 NULL */
 } TestDb;
+
+/* create_sql 의 CREATE TABLE 문장(여러 개 가능, NULL 이면 없음)으로 dir 에 .tbl 을 만든다 */
+static inline bool test_create_tables(const char *dir, const char *create_sql)
+{
+    if (create_sql == NULL)
+        return true;
+    Parser *parser = parser_create(create_sql, strlen(create_sql));
+    if (parser == NULL)
+        return false;
+    bool is_ok = true;
+    Statement stmt;
+    ErrorCode error;
+    while (is_ok && parser_next_statement(parser, &stmt, &error)) {
+        char path[TEST_PATH_MAX];
+        is_ok = error == ERR_NONE && stmt.type == STMT_CREATE &&
+                table_build_path(dir, stmt.create.table, path, sizeof(path)) &&
+                table_create(path, &stmt.create) == ERR_NONE;
+        statement_free(&stmt);
+    }
+    parser_destroy(parser);
+    return is_ok;
+}
 
 static inline TestDb test_db_create(const char *create_sql)
 {
-    (void)create_sql; /* S14 전까지는 디렉터리만 준비한다 */
-    TestDb db = { .dir = test_make_temp_dir() };
+    TestDb db = { .dir = test_make_temp_dir(), .engine = NULL };
+    if (db.dir == NULL || !test_create_tables(db.dir, create_sql))
+        return db;
+    ErrorCode error;
+    char message[MAX_MESSAGE];
+    db.engine = engine_open(db.dir, &error, message);
     return db;
+}
+
+/* 엔진만 닫았다 다시 연다 (파일에 남은 상태 확인용). 실패하면 engine 이 NULL */
+static inline void test_db_reopen(TestDb *db)
+{
+    engine_close(db->engine);
+    ErrorCode error;
+    char message[MAX_MESSAGE];
+    db->engine = engine_open(db->dir, &error, message);
 }
 
 static inline void test_db_destroy(TestDb *db)
 {
+    engine_close(db->engine);
+    db->engine = NULL;
     if (db->dir != NULL)
         test_remove_dir(db->dir); /* 정리 실패는 테스트 결과에 영향이 없어 무시한다 */
     free(db->dir);

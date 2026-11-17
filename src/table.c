@@ -230,7 +230,8 @@ static bool is_valid_header(const TableHeader *header, off_t file_size)
     return (int64_t)file_size >= expected_size;
 }
 
-/* "dir/users.tbl" → "users". .tbl 로 끝나지 않거나 이름이 너무 길면 false */
+/* "dir/Users.tbl" → "users". SQL 식별자가 소문자로 정규화되므로 테이블 이름도 소문자로 맞춘다.
+ * .tbl 로 끝나지 않거나 이름이 너무 길면 false */
 static bool extract_table_name(const char *path, char out_name[MAX_NAME])
 {
     const char *slash = strrchr(path, '/');
@@ -242,7 +243,10 @@ static bool extract_table_name(const char *path, char out_name[MAX_NAME])
     size_t name_len = base_len - ext_len;
     if (name_len >= MAX_NAME)
         return false;
-    memcpy(out_name, base, name_len);
+    for (size_t i = 0; i < name_len; i++) {
+        char c = base[i];
+        out_name[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
     out_name[name_len] = '\0';
     return true;
 }
