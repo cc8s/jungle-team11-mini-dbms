@@ -20,6 +20,8 @@ struct Engine {
     Table **tables;
     int table_count;
     int table_capacity;
+    char (*warnings)[MAX_MESSAGE]; /* 열 때 생긴 경고 (헤더 복구). 테이블마다 최대 1 개 */
+    int warning_count;
 };
 
 /* ---- 열기 ---- */
@@ -62,6 +64,25 @@ static bool add_table(Engine *engine, Table *table)
     return true;
 }
 
+/* 테이블을 열며 헤더를 바로잡았으면 경고 문장을 남긴다. 테이블마다 최대 1 개라서
+ * 경고 배열은 테이블 배열과 같은 크기로 두면 충분하다 */
+static bool add_recovery_warning(Engine *engine, const Table *table)
+{
+    TableRecovery recovery;
+    if (!table_find_recovery(table, &recovery))
+        return true;
+    char (*grown)[MAX_MESSAGE] = realloc(engine->warnings, (size_t)engine->table_capacity *
+                                                               sizeof(*grown));
+    if (grown == NULL)
+        return false;
+    engine->warnings = grown;
+    snprintf(engine->warnings[engine->warning_count++], MAX_MESSAGE,
+             "table '%s' header recovered: row_count %d -> %d, next_id %d -> %d",
+             table_name(table), recovery.old_row_count, recovery.row_count,
+             recovery.old_next_id, recovery.next_id);
+    return true;
+}
+
 /* data_dir/file_name 을 열어 엔진에 붙인다. 이름이 겹치면 (Users.tbl 과 users.tbl) 손상으로 본다 */
 static ErrorCode open_table_file(Engine *engine, const char *data_dir, const char *file_name,
                                  ErrorCode *out_error, char out_message[MAX_MESSAGE])
@@ -83,6 +104,8 @@ static ErrorCode open_table_file(Engine *engine, const char *data_dir, const cha
         table_close(table);
         return open_failure(ERR_INTERNAL, out_error, out_message, "out of memory");
     }
+    if (!add_recovery_warning(engine, table)) /* 테이블은 엔진 소유가 됐으므로 engine_close 가 닫는다 */
+        return open_failure(ERR_INTERNAL, out_error, out_message, "out of memory");
     return ERR_NONE;
 }
 
@@ -133,7 +156,18 @@ void engine_close(Engine *engine)
     for (int i = 0; i < engine->table_count; i++)
         table_close(engine->tables[i]);
     free(engine->tables);
+    free(engine->warnings);
     free(engine);
+}
+
+int engine_warning_count(const Engine *engine)
+{
+    return engine->warning_count;
+}
+
+const char *engine_warning(const Engine *engine, int index)
+{
+    return engine->warnings[index];
 }
 
 /* ---- 실행 ---- */

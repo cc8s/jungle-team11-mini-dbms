@@ -8,6 +8,7 @@
 
 #include "parser.h"
 #include "table.h"
+#include "table_internal.h"
 
 #define USERS_SQL "CREATE TABLE users (id INT, name VARCHAR(32), age INT)"
 #define USERS_RECORD_SIZE 40          /* 4 + 32 + 4 */
@@ -426,6 +427,12 @@ static void test_open_negative_row_count(void)
     header.row_count = 9;
     header.next_id = 10;
     write_table_file(file.path, &header, 9 * USERS_RECORD_SIZE + USERS_RECORD_SIZE / 2);
+    /* Phase 2 부터 열 때 위치 k 의 id 가 k 인지 검사하므로 (S25) 레코드 9 개에 id 를 채운다 */
+    for (int32_t id = 1; id <= 9; id++) {
+        uint8_t id_bytes[sizeof(int32_t)] = {(uint8_t)id, 0, 0, 0}; /* 리틀 엔디언, id < 256 */
+        patch_file(file.path, HEADER_SIZE + (off_t)(id - 1) * USERS_RECORD_SIZE, id_bytes,
+                   sizeof(id_bytes));
+    }
 
     ErrorCode error = ERR_INTERNAL;
     Table *table = table_open(file.path, &error);
@@ -667,11 +674,13 @@ static void check_person(const Table *table, const uint8_t *record, int32_t id,
     CreateStmt create = parse_create(PEOPLE_SQL);
     TableHeader header;
     table_header_from_create(&create, &header);
-    header.next_id = INT32_MAX; /* 이 id 를 쓰면 다음 id 가 int32 를 넘는다 */
     write_table_file(file.path, &header, 0);
     ErrorCode error;
     Table *table = table_open(file.path, &error);
     CHECK(table != NULL);
+    /* 이 id 를 쓰면 다음 id 가 int32 를 넘는다. 일관된 헤더 (row_count = INT32_MAX - 1) 는 파일이
+     * 수십 GB 라 만들 수 없고, 어긋난 헤더는 열 때 복구되므로 (S25) 열린 뒤 메모리에서 바꾼다 */
+    table->header.next_id = INT32_MAX;
 
     uint8_t record[PEOPLE_RECORD_SIZE];
     encode_person(table, INT32_MAX, "kim", "a", 25, record);

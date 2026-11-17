@@ -17,6 +17,12 @@ typedef struct Engine Engine;
 Engine *engine_open(const char *data_dir, ErrorCode *out_error, char out_message[MAX_MESSAGE]);
 void engine_close(Engine *engine);
 
+/* engine_open 이 테이블을 열며 남긴 경고 수와 index 번째 문장 (0 <= index < count).
+ * 지금은 헤더 복구 ("table 'users' header recovered: ...") 뿐이다. 엔진은 출력하지 않으므로
+ * CLI·서버가 꺼내서 stderr 등에 낸다. 문자열은 engine_close 까지 유효하다. */
+int engine_warning_count(const Engine *engine);
+const char *engine_warning(const Engine *engine, int index);
+
 /* sql 한 문장을 실행한다 (단일 문장 모드: 두 번째 문장은 ERR_UNSUPPORTED, 빈 입력은 ERR_SYNTAX).
  * 결과는 호출한 쪽이 result_free 한다. params 는 Phase 3 바인딩용 (지금은 param_count = 0 만). */
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count);

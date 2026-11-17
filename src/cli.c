@@ -200,6 +200,8 @@ static int run_script(const CliOptions *options, const char *text, FILE *out, FI
         fprintf(err, "minidb: %s\n", message);
         return CLI_EXIT_USAGE;
     }
+    for (int i = 0; i < engine_warning_count(engine); i++)
+        fprintf(err, "minidb: warning: %s\n", engine_warning(engine, i));
     ScriptOutput output = { .out = out, .err = err, .is_quiet = options->is_quiet };
     int error_count = engine_execute_script(engine, text, print_result, &output);
     engine_close(engine);
