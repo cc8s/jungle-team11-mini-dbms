@@ -8,3 +8,7 @@ build/
 .vscode/
 __pycache__/
 .venv/
+
+# 로컬 전용 문서
+/CLAUDE.md
+/docs/plan/

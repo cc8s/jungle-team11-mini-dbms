@@ -1,7 +1,8 @@
 #include <stdio.h>
 
-int main(void)
+#include "cli.h"
+
+int main(int argc, char **argv)
 {
-    printf("minidb: SQL 처리기 + B+ 트리 + 스레드 풀 API 서버\n");
-    return 0;
+    return cli_run(argc, argv, stdout, stderr);
 }
