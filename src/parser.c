@@ -367,6 +367,64 @@ static ErrorCode parse_select(Parser *parser, Statement *stmt)
     return error;
 }
 
+/* ---- INSERT ---- */
+
+/* 값 자리의 식별자는 대개 문자열 따옴표를 빠뜨린 것이라 그렇게 알려준다 */
+static ErrorCode parse_insert_value(Parser *parser, Statement *stmt, Value *out_value)
+{
+    const Token *token = current(parser);
+    if (token->type == TOK_IDENT)
+        return fail_at(parser, ERR_SYNTAX, token,
+                       "expected a value (put strings in single quotes)");
+    return parse_value(parser, stmt, out_value);
+}
+
+/* ( value (, value)* ). value_count 는 값이 다 만들어진 뒤에만 올려,
+ * 실패해도 statement_free 가 만들어진 값까지만 해제하게 한다 */
+static ErrorCode parse_insert_values(Parser *parser, Statement *stmt)
+{
+    InsertStmt *insert = &stmt->insert;
+    if (!match(parser, TOK_LPAREN))
+        return fail_at(parser, ERR_SYNTAX, current(parser), "expected '(' after VALUES");
+    for (;;) {
+        if (insert->value_count == MAX_COLUMNS)
+            return fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                           "at most %d values can be inserted", MAX_COLUMNS);
+        ErrorCode error = parse_insert_value(parser, stmt, &insert->values[insert->value_count]);
+        if (error != ERR_NONE)
+            return error;
+        insert->value_count++;
+        if (!match(parser, TOK_COMMA))
+            break;
+    }
+    if (!match(parser, TOK_RPAREN))
+        return fail_at(parser, ERR_SYNTAX, current(parser), "expected ')' or ','");
+    return ERR_NONE;
+}
+
+/* INSERT INTO ident VALUES ( value (, value)* ). 컬럼 목록과 여러 행은 지원 안 함 */
+static ErrorCode parse_insert(Parser *parser, Statement *stmt)
+{
+    InsertStmt *insert = &stmt->insert;
+    advance(parser); /* INSERT */
+    ErrorCode error = expect_keyword(parser, KW_INTO, "INTO");
+    if (error == ERR_NONE)
+        error = expect_identifier(parser, "table name", insert->table);
+    if (error == ERR_NONE && current(parser)->type == TOK_LPAREN)
+        error = fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                        "a column list in INSERT is not supported");
+    if (error == ERR_NONE)
+        error = expect_keyword(parser, KW_VALUES, "VALUES");
+    if (error == ERR_NONE)
+        error = parse_insert_values(parser, stmt);
+    if (error == ERR_NONE && current(parser)->type == TOK_COMMA)
+        error = fail_at(parser, ERR_UNSUPPORTED, current(parser),
+                        "inserting multiple rows is not supported");
+    if (error == ERR_NONE)
+        error = expect_statement_end(parser);
+    return error;
+}
+
 /* ---- 문장 ---- */
 
 static ErrorCode parse_tokens(Parser *parser, Statement *stmt)
@@ -376,6 +434,10 @@ static ErrorCode parse_tokens(Parser *parser, Statement *stmt)
     if (is_keyword(first, KW_SELECT)) {
         stmt->type = STMT_SELECT;
         return parse_select(parser, stmt);
+    }
+    if (is_keyword(first, KW_INSERT)) {
+        stmt->type = STMT_INSERT; /* 먼저 정해 두어야 실패 시 statement_free 가 값을 해제한다 */
+        return parse_insert(parser, stmt);
     }
     if (is_unsupported_word(first))
         return fail_at(parser, ERR_UNSUPPORTED, first, "this statement is not supported");

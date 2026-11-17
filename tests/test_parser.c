@@ -303,6 +303,144 @@ static void test_statement_without_placeholder_has_no_params(void)
     CHECK(parse_error("SELECT * FROM users WHERE age = --5") == ERR_SYNTAX);
 }
 
+/* ---- S07: INSERT ---- */
+
+static Statement parse_insert_ok(const char *sql)
+{
+    Statement stmt;
+    CHECK(parse_one(sql, &stmt) == ERR_NONE);
+    CHECK(stmt.type == STMT_INSERT);
+    return stmt;
+}
+
+static void check_string_value(const Value *value, const char *expected)
+{
+    CHECK(value->type == VAL_STRING);
+    CHECK(value->s.len == strlen(expected));
+    CHECK_STR_EQ(value->s.ptr, expected);
+}
+
+/* T07-01 */ static void test_insert_basic(void)
+{
+    Statement stmt = parse_insert_ok("INSERT INTO users VALUES ('kim', 25)");
+    CHECK_STR_EQ(stmt.insert.table, "users");
+    CHECK(stmt.insert.value_count == 2);
+    check_string_value(&stmt.insert.values[0], "kim");
+    CHECK(stmt.insert.values[1].type == VAL_INT);
+    CHECK(stmt.insert.values[1].i == 25);
+    CHECK(stmt.param_count == 0);
+    statement_free(&stmt);
+}
+
+/* T07-02 */ static void test_insert_single_value(void)
+{
+    Statement stmt = parse_insert_ok("INSERT INTO t VALUES (1);");
+    CHECK_STR_EQ(stmt.insert.table, "t");
+    CHECK(stmt.insert.value_count == 1);
+    CHECK(stmt.insert.values[0].i == 1);
+    statement_free(&stmt);
+}
+
+/* T07-03 */ static void test_insert_negative_and_escaped_string(void)
+{
+    Statement stmt = parse_insert_ok("INSERT INTO t VALUES ('it''s', -1)");
+    CHECK(stmt.insert.value_count == 2);
+    check_string_value(&stmt.insert.values[0], "it's");
+    CHECK(stmt.insert.values[1].type == VAL_INT);
+    CHECK(stmt.insert.values[1].i == -1);
+    statement_free(&stmt);
+}
+
+/* T07-04 */ static void test_insert_placeholders(void)
+{
+    Statement stmt = parse_insert_ok("INSERT INTO t VALUES (?, ?)");
+    CHECK(stmt.insert.value_count == 2);
+    CHECK(stmt.insert.values[0].type == VAL_PARAM);
+    CHECK(stmt.insert.values[0].param_index == 0);
+    CHECK(stmt.insert.values[1].type == VAL_PARAM);
+    CHECK(stmt.insert.values[1].param_index == 1);
+    CHECK(stmt.param_count == 2);
+    statement_free(&stmt);
+}
+
+/* T07-05 */ static void test_insert_split_lines(void)
+{
+    Statement stmt = parse_insert_ok("INSERT INTO users\nVALUES\n('kim', 25)");
+    CHECK(stmt.line == 1);
+    CHECK(stmt.insert.value_count == 2);
+    statement_free(&stmt);
+}
+
+static void test_insert_max_values(void)
+{
+    Statement stmt = parse_insert_ok(
+        "INSERT INTO t VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,'sixteen')");
+    CHECK(stmt.insert.value_count == MAX_COLUMNS);
+    check_string_value(&stmt.insert.values[MAX_COLUMNS - 1], "sixteen");
+    statement_free(&stmt);
+}
+
+/* E07-01 */ static void test_insert_without_into(void)
+{
+    CHECK(parse_error("INSERT users VALUES (1)") == ERR_SYNTAX);
+}
+
+/* E07-02 */ static void test_insert_without_values(void)
+{
+    CHECK(parse_error("INSERT INTO users ('kim')") == ERR_UNSUPPORTED);
+}
+
+/* E07-03 */ static void test_insert_empty_parens(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES ()") == ERR_SYNTAX);
+}
+
+/* E07-04 */ static void test_insert_trailing_comma(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES ('kim',)") == ERR_SYNTAX);
+}
+
+/* E07-05 */ static void test_insert_missing_rparen(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES ('kim', 25") == ERR_SYNTAX);
+    CHECK(parse_error("INSERT INTO t VALUES ('kim', 25;") == ERR_SYNTAX);
+}
+
+/* E07-06 */ static void test_insert_without_parens(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES 'kim', 25") == ERR_SYNTAX);
+}
+
+/* E07-07 */ static void test_insert_too_many_values(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17)")
+          == ERR_UNSUPPORTED);
+    /* 문자열 값을 만든 뒤 실패해도 새지 않아야 한다 (ASan 으로 확인) */
+    CHECK(parse_error("INSERT INTO t VALUES ('a','b','c','d','e','f','g','h',"
+                      "'i','j','k','l','m','n','o','p','q')") == ERR_UNSUPPORTED);
+}
+
+/* E07-08 */ static void test_insert_identifier_as_value(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES (kim, 25)") == ERR_SYNTAX);
+    CHECK(parse_error("INSERT INTO t VALUES ('lee', kim)") == ERR_SYNTAX);
+}
+
+/* E07-09 */ static void test_insert_multiple_rows(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES (1), (2)") == ERR_UNSUPPORTED);
+}
+
+/* E07-10 */ static void test_insert_column_list(void)
+{
+    CHECK(parse_error("INSERT INTO t (name) VALUES ('a')") == ERR_UNSUPPORTED);
+}
+
+static void test_insert_extra_token_after_values(void)
+{
+    CHECK(parse_error("INSERT INTO t VALUES (1) 2") == ERR_SYNTAX);
+}
+
 int main(void)
 {
     RUN(test_select_all);
@@ -344,6 +482,23 @@ int main(void)
     RUN(test_limit_before_where);
     RUN(test_where_twice);
     RUN(test_where_value_hidden_by_comment);
+    RUN(test_insert_basic);
+    RUN(test_insert_single_value);
+    RUN(test_insert_negative_and_escaped_string);
+    RUN(test_insert_placeholders);
+    RUN(test_insert_split_lines);
+    RUN(test_insert_max_values);
+    RUN(test_insert_without_into);
+    RUN(test_insert_without_values);
+    RUN(test_insert_empty_parens);
+    RUN(test_insert_trailing_comma);
+    RUN(test_insert_missing_rparen);
+    RUN(test_insert_without_parens);
+    RUN(test_insert_too_many_values);
+    RUN(test_insert_identifier_as_value);
+    RUN(test_insert_multiple_rows);
+    RUN(test_insert_column_list);
+    RUN(test_insert_extra_token_after_values);
     TEST_DONE();
     return 0;
 }
