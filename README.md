@@ -29,6 +29,8 @@ python3 tools/gen_sql.py 1000000 > data/bulk.sql   # 대량 INSERT SQL (이름 u
 ./minidb -q data/bulk.sql         # 100 만 건 삽입 (측정 결과: docs/benchmark.md)
 ./minidb serve 8080 8             # HTTP API 서버 (포트, 워커 수, [큐 용량 = 워커 × 16])
 curl http://localhost:8080/health # {"ok":true}
+curl -X POST http://localhost:8080/query -d '{"sql":"INSERT INTO users VALUES (?, ?)","params":["kim",25]}'
+curl -X POST http://localhost:8080/query -d '{"sql":"SELECT * FROM users WHERE id = ?","params":[1]}'
 ```
 
 종료 코드: 모든 문장 성공 `0`, SQL 에러가 하나라도 있음 `1`, 사용법·파일·디렉터리 오류 `2`.
@@ -119,6 +121,13 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 - **쓰기 우선**: `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`. 기다리는 쓰기가 있으면 새 읽기를 막아 SELECT 가 끊이지 않아도 INSERT 가 굶지 않는다.
 - **교착 없음**: 문장 하나는 테이블 하나만 쓰므로 한 번에 락 하나만 잡는다.
 
+### Prepared Statement (`?` + `params`)
+
+- `?` 는 값 자리 (INSERT 값, `WHERE` 오른쪽) 에만 쓸 수 있다. 테이블·컬럼 이름이나 `LIMIT` 자리는 `ERR_SYNTAX`.
+- 엔진은 SQL 틀만 파싱하고, 검증 단계 (`validator_bind_params`) 에서 `?` 자리의 `Value` 를 params 값으로 바꾼다. 값은 토크나이저·파서를 거치지 않으므로 따옴표나 `;` 가 들어 있어도 데이터일 뿐이다 (이스케이프 불필요).
+- 바꾼 값은 보통 값처럼 검사한다: 개수 불일치·`\0` 이 든 문자열은 `ERR_PARAM`, 타입이 다르면 `ERR_TYPE_MISMATCH`, 길이 초과는 `ERR_VALUE_TOO_LONG`.
+- API 는 요청당 한 문장 (`;` 뒤에 문장이 또 있으면 `ERR_UNSUPPORTED`). CLI 스크립트에는 바인딩이 없어서 `?` 는 `ERR_PARAM`.
+
 ## 테스트
 
 `make test` 는 `tests/test_*.c` 를 각각 실행 파일로 만들어 돌린다. 테스트마다 `mkdtemp` 임시 디렉터리를 쓰고, 에러는 메시지 문구가 아니라 `ErrorCode` 로 확인한다.
@@ -128,6 +137,7 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 | 단위 | `test_tokenizer` `test_parser` `test_table` `test_validator` `test_format` — 모듈별 정상·엣지 케이스 (식별자 31/32 자, INT 경계, VARCHAR n/n+1 바이트, 컬럼 16/17 개, 문장 64KB, 손상된 헤더 등) |
 | 기능 | `test_engine` `test_cli` — 엔진 열기/INSERT/SELECT/스크립트, CLI 옵션·종료 코드·init |
 | 통합 | `test_integration` — init → 100 건 INSERT → 조건별 SELECT, 재실행 후 데이터 유지, 문장 1,000 개 혼합 스크립트, 테이블 2 개 교차 |
+| 바인딩 | `test_bind` — `?` 자리에 정수·문자열, 따옴표·`;` 가 든 값, 개수·타입·길이 불일치, 이름·`LIMIT` 자리의 `?`, 두 문장 |
 | 동시성 | `test_threadpool` `test_concurrency` — 큐·워커·종료, 읽기끼리 동시·쓰기 중 읽기 대기·쓰기 우선·에러 경로 락 해제·다른 테이블 동시 쓰기. 스레드 8 × INSERT 1 만 건 후 id 1..80,000 중복·빈 곳 없음, INSERT 2 + SELECT 6 혼합에서 쓰다 만 행 미노출·행 수 단조 증가, 서버 경유 클라이언트 16 × 요청 500. `make test-tsan` (데이터 레이스), `make test-global` (GLOBAL 락 빌드) |
 | B+ 트리 | `test_btree` — split 경계, 범위 순회, 오름·내림·무작위 10 만 건. `make test` 가 `BTREE_ORDER` 3, 4 빌드로 한 번 더 돌림 (`make test-order`) |
 | 메모리 | `make test-asan` — 전체 테스트를 AddressSanitizer 로 다시 돌려 누수·오버플로 확인 |

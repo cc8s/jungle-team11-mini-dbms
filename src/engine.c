@@ -300,14 +300,22 @@ static Result execute_statement(Engine *engine, const Statement *stmt)
     return result;
 }
 
+/* API 경로: ? 자리를 params 로 채운 뒤 보통 문장처럼 검증·실행한다. 바인딩은 문장 구조만 바꾸므로
+ * 락 밖에서 한다 (개수가 안 맞는 요청은 락을 잡지 않고 끝난다) */
+static Result bind_and_execute(Engine *engine, Statement *stmt, const Value *params,
+                               int param_count)
+{
+    char message[MAX_MESSAGE];
+    ErrorCode error = validator_bind_params(stmt, params, param_count, message);
+    if (error != ERR_NONE)
+        return result_error(error, stmt->line, "%s", message);
+    return execute_statement(engine, stmt);
+}
+
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count)
 {
-    (void)params;
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    if (param_count > 0) /* TODO(S42): 바인딩 */
-        return result_error(ERR_UNSUPPORTED, 0, "parameter binding is not supported yet");
-
     Statement stmt;
     ParseError parse_error;
     Result result;
@@ -315,7 +323,7 @@ Result engine_execute(Engine *engine, const char *sql, const Value *params, int 
     if (error != ERR_NONE)
         result = result_error(error, parse_error.line, "%s", parse_error.message);
     else
-        result = execute_statement(engine, &stmt);
+        result = bind_and_execute(engine, &stmt, params, param_count);
     statement_free(&stmt);
     result.elapsed_ms = elapsed_ms_since(&start);
     return result;

@@ -43,7 +43,10 @@ const char *engine_lock_mode_name(void);
  * 엔진 안의 락이 감싼다). engine_open / engine_close 는 서버 시작 전·종료 후 한 스레드에서만 부른다.
  *
  * sql 한 문장을 실행한다 (단일 문장 모드: 두 번째 문장은 ERR_UNSUPPORTED, 빈 입력은 ERR_SYNTAX).
- * 결과는 호출한 쪽이 result_free 한다. params 는 Phase 3 바인딩용 (지금은 param_count = 0 만). */
+ * 결과는 호출한 쪽이 result_free 한다.
+ * params 는 sql 의 ? 자리에 순서대로 들어갈 값 param_count 개 (VAL_INT 또는 VAL_STRING, NULL·0 이면 없음).
+ * ? 는 값 자리에만 쓸 수 있고 (이름·LIMIT 자리는 ERR_SYNTAX), 개수가 안 맞으면 ERR_PARAM.
+ * 엔진은 값을 복사하므로 params 는 호출이 끝나면 바로 해제해도 된다. */
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count);
 
 /* 스크립트의 문장 하나가 끝날 때마다 불린다. stmt_index 는 1 부터 (에러 문장 포함, 빈 문장 제외).

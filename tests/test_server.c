@@ -427,6 +427,32 @@ static void test_query_json_errors(void)
     stop_server(&ts);
 }
 
+/* S42: JSON params 가 엔진 바인딩까지 간다. 따옴표가 든 값도 이스케이프 없이 데이터로 저장된다 */
+static void test_query_with_params(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    Response response;
+    post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES (?, ?)\",\"params\":[\"it's\",25]}",
+               &response);
+    CHECK(response.status == 200);
+    CHECK(insert_id_of(&response) == 1);
+    post_query(ts.port, "{\"sql\":\"SELECT name, age FROM users WHERE id = ?\",\"params\":[1]}",
+               &response);
+    CHECK(response.status == 200);
+    CHECK(strstr(response.body, "\"rows\":[[\"it's\",25]]") != NULL);
+    CHECK(strstr(response.body, "\"used_index\":true") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT * FROM users WHERE id = ?\",\"params\":[]}",
+               &response);
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"PARAM\"") != NULL);
+    post_query(ts.port, "{\"sql\":\"SELECT * FROM users WHERE id = ?\",\"params\":[\"1\"]}",
+               &response);
+    CHECK(response.status == 400);
+    CHECK(strstr(response.body, "\"code\":\"TYPE_MISMATCH\"") != NULL);
+    stop_server(&ts);
+}
+
 /* E37-01 */
 static void test_error_status_table(void)
 {
@@ -951,6 +977,7 @@ int main(void)
     RUN(test_query_select_after_insert);
     RUN(test_query_engine_errors);
     RUN(test_query_json_errors);
+    RUN(test_query_with_params);
     RUN(test_error_status_table);
     RUN(test_query_too_large);
     RUN(test_query_io_error);

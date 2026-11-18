@@ -241,6 +241,7 @@ static void test_statement_without_placeholder_has_no_params(void)
 {
     CHECK(parse_error("SELECT * FROM users WHERE 3 = id") == ERR_UNSUPPORTED);
     CHECK(parse_error("SELECT * FROM users WHERE 'kim' = name") == ERR_UNSUPPORTED);
+    CHECK(parse_error("SELECT * FROM users WHERE ? = name") == ERR_SYNTAX); /* E42-06 이름 자리 */
 }
 
 /* E06-05 */ static void test_where_column_to_column(void)

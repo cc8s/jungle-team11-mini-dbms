@@ -176,3 +176,50 @@ ErrorCode validator_check(const Statement *stmt, Table *const *tables, int table
     out_message[0] = '\0';
     return check_statement(stmt, tables, table_count, out_plan, out_message);
 }
+
+/* ---- 바인딩 (API 경로) ---- */
+
+/* slot 이 ? 면 params 의 해당 값으로 바꾼다. 문자열은 복사해서 문장이 소유한다 (statement_free 가 해제).
+ * 값을 SQL 텍스트에 끼워 넣지 않고 파싱이 끝난 Value 자리에 넣으므로, 따옴표·세미콜론·SQL 조각이 든
+ * 문자열도 그 바이트 그대로 데이터일 뿐이다 (인젝션 1 차 방어선) */
+static ErrorCode bind_value(Value *slot, const Value *params, char out_message[MAX_MESSAGE])
+{
+    if (slot->type != VAL_PARAM)
+        return ERR_NONE;
+    int number = slot->param_index + 1; /* 메시지는 1 부터 센다 */
+    const Value *param = &params[slot->param_index];
+    if (param->type == VAL_INT) {
+        *slot = value_from_int(param->i);
+        return ERR_NONE;
+    }
+    if (param->type != VAL_STRING)
+        return fail(out_message, ERR_PARAM, "parameter %d must be an integer or a string", number);
+    /* VARCHAR 는 남는 칸을 \0 으로 채우므로 \0 이 든 값은 읽을 때 잘려 보인다 */
+    if (memchr(param->s.ptr, '\0', param->s.len) != NULL)
+        return fail(out_message, ERR_PARAM, "parameter %d contains a NUL byte", number);
+    Value copy = value_from_string(param->s.ptr, param->s.len);
+    if (copy.s.ptr == NULL)
+        return fail(out_message, ERR_INTERNAL, "out of memory while binding parameter %d", number);
+    *slot = copy;
+    return ERR_NONE;
+}
+
+ErrorCode validator_bind_params(Statement *stmt, const Value *params, int param_count,
+                                char out_message[MAX_MESSAGE])
+{
+    out_message[0] = '\0';
+    if (param_count != stmt->param_count)
+        return fail(out_message, ERR_PARAM,
+                    "statement has %d placeholder(s) but %d parameter(s) were given",
+                    stmt->param_count, param_count);
+    ErrorCode error = ERR_NONE;
+    if (stmt->type == STMT_INSERT) {
+        for (int i = 0; error == ERR_NONE && i < stmt->insert.value_count; i++)
+            error = bind_value(&stmt->insert.values[i], params, out_message);
+    } else if (stmt->type == STMT_SELECT && stmt->select.has_where) {
+        error = bind_value(&stmt->select.where.value, params, out_message);
+    }
+    if (error == ERR_NONE)
+        stmt->param_count = 0; /* 이제 ? 가 없으므로 validator_check 가 보통 문장처럼 검사한다 */
+    return error;
+}
