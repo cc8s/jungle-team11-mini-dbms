@@ -21,6 +21,7 @@ make test-global                  # 같은 테스트를 LOCK_MODE=GLOBAL 빌드�
 make check-banned                 # 전역 변수, 함수 안 static, strtok·strerror 같은 비재진입 함수 점검
 make LOCK_MODE=GLOBAL             # 전역 뮤텍스로 빌드 (성능 비교용)
 make bench                        # 인덱스 대 선형 탐색 벤치마크 (1만·10만·100만 건, 약 1 분)
+bench/run_load.sh                 # HTTP 서버 부하 측정 (wrk, 워커 수 × 락 방식, 약 10 분)
 mkdir -p data                     # 데이터 디렉터리 (git 제외)
 ./minidb init schema/users.sql    # 스키마로 data/users.tbl 생성
 ./minidb query.sql                # SQL 파일 실행
@@ -51,7 +52,28 @@ ERROR (line 5, statement 3): near 'SELEC': expected a statement   ← stderr
 
 ## 아키텍처
 
-<!-- SQL → 토크나이저 → 파서 → 실행기 → (B+ 트리 | 선형 탐색) → 파일 저장소 / HTTP → 스레드 풀 → 엔진 -->
+```
+CLI: minidb query.sql                HTTP: POST /query
+    |                                    |
+    |                          accept loop (1 thread) --- queue full -> 503
+    |                                    | fd
+    |                          job queue (bounded ring buffer)
+    |                                    |
+    |                          worker x N: read HTTP -> route -> parse JSON
+    |                                    |
+    +----------------+-------------------+
+                     v
+  engine:  tokenizer -> parser -> validator (+ bind ?)      <- no lock
+                                       |
+                              lock_table (read / write)
+                              executor: B+ tree (id) | linear scan --pread/pwrite--> data/<table>.tbl
+                              unlock_table
+                                       |
+                                       v  Result
+                     format (CLI table) | json (HTTP response)            <- no lock
+```
+
+의존 방향은 한쪽으로만: `cli/server → engine → parser → tokenizer`, `engine → validator/executor → table, btree`, `format/json → result`. 엔진은 출력하지 않고 `Result` 만 돌려주므로 CLI 와 서버가 같은 엔진을 그대로 쓴다.
 
 ## 핵심 로직
 
@@ -114,12 +136,42 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 
 ### 스레드 풀과 동시성
 
-<!-- 작업 큐(mutex + condvar) -->
+- **스레드 풀** (`src/threadpool.c`): 워커 N 개가 유한 작업 큐 (링 버퍼) 하나를 공유한다. 큐는 뮤텍스 + 조건 변수 `not_empty` 로 보호하고, 워커는 `while` 루프 안에서 `cond_wait` 한다 (가짜 깨어남 대비). 꺼낸 연결은 락 밖에서 처리한다.
+- **백프레셔**: accept 루프는 `submit` 에서 기다리지 않는다. 큐가 가득 차면 그 자리에서 `503` + `Retry-After: 1` 을 보내고 닫는다. 느린 서버가 연결을 무한정 쌓아 두지 않게 하는 장치다.
+- **요청 하나**: 워커가 요청을 읽고 (`SO_RCVTIMEO` 5 초, 머리 8KB·본문 64KB 제한) 라우팅한 뒤 응답을 `sendmsg` 한 번으로 보낸다. 닫기 전에 `shutdown(SHUT_WR)` 후 남은 입력을 잠깐 비워서 (lingering close) 상대가 응답을 읽기 전에 RST 로 끊기지 않게 한다.
+- **우아한 종료** (SIGINT/SIGTERM): 시그널은 모든 스레드에서 막아 두고, accept 루프만 `ppoll` 로 기다리는 동안 받는다. 핸들러는 `sig_atomic_t` 플래그 하나만 세운다. 종료 순서는 listen 소켓 닫기 (새 연결 거부) → 큐에 남은 요청까지 처리하고 워커 join → 엔진 닫기.
+- **상태**: 전역 변수 없이 `Engine`/`Table`/`ThreadPool`/`Server` 안에 둔다 (예외는 시그널 플래그 하나). 통계 카운터는 `atomic` 이다. `make check-banned` 가 전역 변수와 `strtok`·`strerror` 같은 비재진입 함수를 찾는다.
 
 - **락 방식** (`make LOCK_MODE=...`, `/stats` 의 `lock_mode`): `TABLE_RW` (기본) 는 테이블마다 쓰기 우선 RW 락, `GLOBAL` 은 엔진 뮤텍스 하나. 방식에 따른 차이는 `engine.c` 의 `lock_table` / `unlock_table` 에만 있다.
 - **락 범위**: 실행 단계 (`executor_run`) 만. SELECT 는 읽기 락 안에서 인덱스·스캔·레코드 복사, INSERT 는 쓰기 락 안에서 id 발급 → 레코드 `pwrite` → 헤더 `pwrite` → `btree_insert`. 파싱·검증·JSON 변환은 락 밖이고, 검증에 실패한 문장은 락을 잡지 않는다.
 - **쓰기 우선**: `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`. 기다리는 쓰기가 있으면 새 읽기를 막아 SELECT 가 끊이지 않아도 INSERT 가 굶지 않는다.
 - **교착 없음**: 문장 하나는 테이블 하나만 쓰므로 한 번에 락 하나만 잡는다.
+
+### HTTP API
+
+`./minidb serve <port> <threads> [queue_cap]` — `0.0.0.0:<port>` 에 뜬다. 요청마다 연결을 닫는다 (`Connection: close`).
+
+| 메서드 | 경로 | 하는 일 |
+|---|---|---|
+| `POST` | `/query` | SQL 한 문장 실행. 본문 `{"sql": "...", "params": [...]}` (`params` 는 선택, 정수 또는 문자열 최대 64 개) |
+| `GET` | `/tables` | 테이블 목록, 컬럼 (이름·타입·크기), 현재 행 수 |
+| `GET` | `/health` | `{"ok":true}` |
+| `GET` | `/stats` | 처리 요청 수, 에러 수, 503 수, 큐 길이·용량, 워커 수, 락 방식, 가동 시간 |
+
+```text
+POST /query {"sql":"INSERT INTO users VALUES (?, ?)","params":["kim",25]}
+→ 200 {"ok":true,"affected_rows":1,"last_insert_id":1,"elapsed_ms":0.021}
+
+POST /query {"sql":"SELECT * FROM users WHERE id = ?","params":[1]}
+→ 200 {"ok":true,"columns":["id","name","age"],"rows":[[1,"kim",25]],"row_count":1,
+       "truncated":false,"used_index":true,"elapsed_ms":0.026}
+
+POST /query {"sql":"SELECT * FROM nope"}
+→ 404 {"ok":false,"error":{"code":"UNKNOWN_TABLE","message":"unknown table 'nope'"}}
+```
+
+- SELECT 응답은 최대 1,000 행. 넘으면 `"truncated":true` 이고 `row_count` 는 전체 행 수다.
+- 상태 코드는 표 하나 (`server_status_for_error`) 로 정한다. 문법·타입·값·바인딩 에러 `400`, 없는 테이블 `404`, 문장 64KB 초과 `413`, 파일·손상·내부 에러 `500`. HTTP 계층은 `400` 깨진 요청, `404`/`405` (+ `Allow`) 라우팅, `408` 읽기 타임아웃, `411` `Content-Length` 없음, `413`/`414`/`431` 크기 초과, `501` chunked, `503` 과부하, `505` 버전.
 
 ### Prepared Statement (`?` + `params`)
 
@@ -177,7 +229,33 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 
 인덱스 검색은 N 이 100 배가 되어도 거의 일정하고 (O(log N)), 선형 탐색은 N 에 비례한다 (O(N)). 100 만 건 INSERT 는 약 3.3 s (초당 약 30 만 건).
 
+## 성능 비교 (HTTP 서버 부하)
+
+`bench/run_load.sh` 로 잰다: `wrk -t4 -c64 -d30s`, 데이터 10 만 건, 측정마다 같은 초기 상태로 시작. `wrk` 와 서버가 컨테이너의 코어 2 개를 나눠 쓴다. 방법과 전체 표는 [docs/benchmark.md](docs/benchmark.md) Phase 3.
+
+| 부하 | `GLOBAL` | `TABLE_RW` | 해석 |
+|---|---|---|---|
+| id 조회 90% + INSERT 10%, 워커 1 ~ 16 | 17,475 ~ 18,456 req/s | 15,101 ~ 18,824 req/s | 워커 수·락 방식과 관계없이 비슷. 락 구간 (수 µs) 보다 요청마다 TCP 연결을 맺고 끊는 비용이 훨씬 크다 |
+| 선형 스캔 읽기 100% (10 만 건), 워커 4 | 251 req/s | 477 req/s | 락 안에 수 ms 머물면 RW 락 효과가 드러난다 (약 1.9 배 ≈ 코어 2 개) |
+| INSERT 100%, 워커 4 | 21,351 req/s | 17,761 req/s | 테이블 하나에 쓰기는 어느 방식이든 한 줄로 선다 |
+| 과부하: 워커 2 + 큐 2, 연결 64 | — | 503 비율 77.9% | 큐가 차면 바로 503, 서버는 끝까지 응답 |
+
+모든 측정에서 데이터를 검증했다. `row_count` 증가분은 200 을 받은 INSERT 수에, 마감 순간 처리 중이던 INSERT (64 개 이하) 를 더한 값과 맞았다. 다시 열 때 복구 경고도 없었다.
+
 ## 실제 DBMS 와의 차이
+
+| 영역 | 이 프로젝트 | 실제 DBMS (예: PostgreSQL, MySQL InnoDB) |
+|---|---|---|
+| SQL | `INSERT`, `SELECT` (조건 하나, `LIMIT`). `UPDATE`·`DELETE`·`JOIN`·`ORDER BY`·`AND`/`OR` 없음 | 전체 SQL, 쿼리 최적화기 |
+| 저장 | 고정 길이 레코드를 id 순서로 이어 쓴 파일 하나. 버퍼 풀 없이 OS 페이지 캐시에 맡김 | 페이지 단위 저장, 자체 버퍼 풀, 가변 길이 행 |
+| 내구성 | `fsync` 없음. 비정상 종료는 열 때 꼬리 레코드로 헤더를 복구 | WAL (선행 기록 로그), 체크포인트, 장애 복구 |
+| 트랜잭션 | 없음. 문장 하나가 원자 단위 (락 안에서 레코드 → 헤더 → 인덱스) | `BEGIN`/`COMMIT`, 격리 수준, 롤백 |
+| 인덱스 | id 하나, 메모리 B+ 트리를 열 때마다 파일 스캔으로 재구축 | 디스크 페이지 B+ 트리, 보조 인덱스, 재구축 없이 열림 |
+| 동시성 | 테이블 단위 RW 락 (쓰기 우선). 같은 테이블 쓰기는 한 번에 하나 | 행 단위 락, MVCC (읽기가 쓰기를 기다리지 않음) |
+| 연결 | HTTP/1.1, 요청마다 연결을 닫음 (keep-alive 없음), 인증 없음 | 전용 바이너리 프로토콜, 오래 유지되는 연결과 커넥션 풀, 인증·권한 |
+| Prepared Statement | 요청마다 SQL 을 다시 파싱하고 `?` 에 값을 넣음 | 서버가 준비된 문장과 실행 계획을 캐시 |
+
+부하 측정에서 id 조회 하나의 엔진 실행은 약 2 µs 인데, 서버 전체 처리량은 워커 수와 관계없이 초당 1.5 만 ~ 1.9 만 요청 (요청당 50 ~ 60 µs) 에서 멈췄다. 나머지 대부분은 요청마다 TCP 연결을 맺고 끊고, HTTP·JSON 을 파싱하고 만드는 비용이다. 실제 DBMS 가 연결을 유지하고 커넥션 풀을 쓰는 이유가 여기 있다.
 
 ## 팀
 
