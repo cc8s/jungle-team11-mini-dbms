@@ -1,7 +1,7 @@
-#include <stdio.h>
+#include "cli.h"
 
-int main(void)
+/* Phase 3 에서 서버 모드(--server)가 여기에 붙는다 */
+int main(int argc, char **argv)
 {
-    printf("minidb: SQL 처리기 + B+ 트리 + 스레드 풀 API 서버\n");
-    return 0;
+    return cli_main(argc, argv);
 }
