@@ -1,7 +1,7 @@
 #ifndef MINI_DBMS_TOKENIZER_H
 #define MINI_DBMS_TOKENIZER_H
 
-/* SQL 문자열을 앞에서부터 토큰 하나씩 잘라 낸다.
+/* SQL 문자열을 앞에서부터 토큰 하나씩 잘라 낸다. 공백과 -- 줄 주석은 건너뛴다.
  * 키워드는 따로 구분하지 않고 TOKEN_IDENT 로 낸다. 키워드인지는 파서가 자리를 보고 판단한다. */
 
 #include <stdbool.h>

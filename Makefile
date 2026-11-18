@@ -8,7 +8,7 @@ LIB_SRCS := $(filter-out src/main.c, $(SRCS))
 LIB_OBJS := $(patsubst src/%.c, build/%.o, $(LIB_SRCS))
 TESTS    := $(patsubst tests/%.c, tests/bin/%, $(wildcard tests/test_*.c))
 
-.PHONY: all test run clean
+.PHONY: all test sqltest run clean
 
 all: $(BIN)
 
@@ -27,6 +27,10 @@ tests/bin/%: tests/%.c $(LIB_OBJS) | tests/bin
 # 테스트 실행 파일을 하나씩 돌리고, 하나라도 실패하면 make 가 실패한다
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; ./$$t || exit 1; done
+
+# SQL 기능 테스트: tests/sql/*.sql 실행 결과를 .out 과 비교
+sqltest: $(BIN)
+	@sh tests/run_sql_tests.sh
 
 run: $(BIN)
 	./$(BIN)

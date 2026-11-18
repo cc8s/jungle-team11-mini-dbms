@@ -1,0 +1,18 @@
+INSERT 1 (id = 1)
+INSERT 1 (id = 2)
+INSERT 1 (id = 3)
+id | name | email | age
+1 | kim | kim@jungle.kr | 20
+2 | lee | lee@jungle.kr | 31
+3 | park |  | 27
+(3 rows)
+name | age
+kim | 20
+(1 row)
+id | name
+3 | park
+(1 row)
+id
+2
+3
+(2 rows)

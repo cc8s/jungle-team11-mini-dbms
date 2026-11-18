@@ -19,10 +19,19 @@ static void set_error(struct token *out, const char *msg)
     snprintf(out->text, sizeof(out->text), "%s", msg);
 }
 
+/* 공백과 -- 줄 주석을 건너뛴다. 주석은 줄 끝(또는 입력 끝)까지 */
 static void skip_whitespace(struct tokenizer *tz)
 {
-    while (isspace((unsigned char)tz->src[tz->pos])) {
-        tz->pos++;
+    for (;;) {
+        while (isspace((unsigned char)tz->src[tz->pos])) {
+            tz->pos++;
+        }
+        if (tz->src[tz->pos] != '-' || tz->src[tz->pos + 1] != '-') {
+            return;
+        }
+        while (tz->src[tz->pos] != '\0' && tz->src[tz->pos] != '\n') {
+            tz->pos++;
+        }
     }
 }
 
