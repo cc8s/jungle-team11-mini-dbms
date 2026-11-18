@@ -17,6 +17,8 @@ C 로 직접 만든 **SQL 처리기 + B+ 트리 인덱스 + 스레드 풀 API �
 ```bash
 make                              # 빌드
 make test                         # 단위·통합 테스트 (make test-asan: AddressSanitizer, make test-tsan: ThreadSanitizer)
+make test-global                  # 같은 테스트를 LOCK_MODE=GLOBAL 빌드로 (기본은 TABLE_RW)
+make LOCK_MODE=GLOBAL             # 전역 뮤텍스로 빌드 (성능 비교용)
 make bench                        # 인덱스 대 선형 탐색 벤치마크 (1만·10만·100만 건, 약 1 분)
 mkdir -p data                     # 데이터 디렉터리 (git 제외)
 ./minidb init schema/users.sql    # 스키마로 data/users.tbl 생성
@@ -109,7 +111,12 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 
 ### 스레드 풀과 동시성
 
-<!-- 작업 큐(mutex + condvar), 테이블별 rwlock, id 증가는 write lock 안에서 -->
+<!-- 작업 큐(mutex + condvar) -->
+
+- **락 방식** (`make LOCK_MODE=...`, `/stats` 의 `lock_mode`): `TABLE_RW` (기본) 는 테이블마다 쓰기 우선 RW 락, `GLOBAL` 은 엔진 뮤텍스 하나. 방식에 따른 차이는 `engine.c` 의 `lock_table` / `unlock_table` 에만 있다.
+- **락 범위**: 실행 단계 (`executor_run`) 만. SELECT 는 읽기 락 안에서 인덱스·스캔·레코드 복사, INSERT 는 쓰기 락 안에서 id 발급 → 레코드 `pwrite` → 헤더 `pwrite` → `btree_insert`. 파싱·검증·JSON 변환은 락 밖이고, 검증에 실패한 문장은 락을 잡지 않는다.
+- **쓰기 우선**: `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`. 기다리는 쓰기가 있으면 새 읽기를 막아 SELECT 가 끊이지 않아도 INSERT 가 굶지 않는다.
+- **교착 없음**: 문장 하나는 테이블 하나만 쓰므로 한 번에 락 하나만 잡는다.
 
 ## 테스트
 
@@ -120,7 +127,7 @@ offset 1024  레코드 영역: id 번째 레코드 = 1024 + (id - 1) × record_s
 | 단위 | `test_tokenizer` `test_parser` `test_table` `test_validator` `test_format` — 모듈별 정상·엣지 케이스 (식별자 31/32 자, INT 경계, VARCHAR n/n+1 바이트, 컬럼 16/17 개, 문장 64KB, 손상된 헤더 등) |
 | 기능 | `test_engine` `test_cli` — 엔진 열기/INSERT/SELECT/스크립트, CLI 옵션·종료 코드·init |
 | 통합 | `test_integration` — init → 100 건 INSERT → 조건별 SELECT, 재실행 후 데이터 유지, 문장 1,000 개 혼합 스크립트, 테이블 2 개 교차 |
-| 동시성 | Phase 3 |
+| 동시성 | `test_threadpool` `test_concurrency` — 큐·워커·종료, 읽기끼리 동시·쓰기 중 읽기 대기·쓰기 우선·에러 경로 락 해제·다른 테이블 동시 쓰기. `make test-tsan` (데이터 레이스), `make test-global` (GLOBAL 락 빌드) |
 | B+ 트리 | `test_btree` — split 경계, 범위 순회, 오름·내림·무작위 10 만 건. `make test` 가 `BTREE_ORDER` 3, 4 빌드로 한 번 더 돌림 (`make test-order`) |
 | 메모리 | `make test-asan` — 전체 테스트를 AddressSanitizer 로 다시 돌려 누수·오버플로 확인 |
 | 느린 테스트 | `make test-slow` — 100 만 건 트리를 일반·ASan 빌드에서 검사 (`MINIDB_SLOW_TESTS=1`) |

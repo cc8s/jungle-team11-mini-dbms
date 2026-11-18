@@ -65,12 +65,20 @@ typedef struct {
  *   ERR_IO      파일을 열거나 읽거나 헤더를 고쳐 쓸 수 없음 (없음, 권한, 디렉터리 등)
  *   ERR_CORRUPT 헤더보다 작음, magic·version·컬럼·record_size 이상, 레코드가 row_count 보다 모자람,
  *               row_count 안의 위치 k 레코드 id 가 k 가 아님
- *   ERR_INTERNAL 메모리 부족
+ *   ERR_INTERNAL 메모리 부족, 테이블 락을 만들 수 없음
  * 헤더 복구 (비정상 종료 대비): row_count 뒤에 완전하고 id 가 이어지는 레코드가 있으면 채택하고,
  * 처음으로 어긋나는 레코드 (반쪽, id 불일치, 0 으로 채워짐) 부터는 무시한다.
  * next_id 는 row_count + 1 로 맞춘다. 값이 바뀌었으면 헤더를 다시 쓰고 table_find_recovery 로 알린다. */
 Table *table_open(const char *path, ErrorCode *out_error);
 void table_close(Table *table);
+
+/* ---- 테이블 락 (LOCK_MODE TABLE_RW 에서 엔진이 쓴다) ----
+ * 읽기 락은 여러 스레드가 동시에, 쓰기 락은 혼자 잡는다. 쓰기 우선이라 쓰기가 기다리기 시작하면
+ * 새 읽기는 그 쓰기가 끝날 때까지 기다린다 (읽기가 계속 들어와도 쓰기가 굶지 않는다).
+ * 한 스레드가 같은 테이블 락을 겹쳐 잡으면 안 된다 (재귀 불가). 해제는 둘 다 table_unlock */
+void table_lock_read(Table *table);
+void table_lock_write(Table *table);
+void table_unlock(Table *table);
 
 /* 열 때 헤더를 바로잡았으면 true 와 그 내용. 아니면 false */
 bool table_find_recovery(const Table *table, TableRecovery *out_recovery);

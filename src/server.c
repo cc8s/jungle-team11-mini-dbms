@@ -213,9 +213,10 @@ static const char *column_type_name(ColumnType type)
 }
 
 /* {"name":"users","columns":[{"name":"id","type":"INT","size":4},...],"row_count":3}
- * 스키마는 락 없이, 바뀌는 row_count 는 engine_record_count (엔진 락) 로 읽는다 */
-static void append_table(JsonBuf *buf, Engine *engine, const Table *table)
+ * 스키마는 락 없이, 바뀌는 row_count 는 engine_record_count (테이블 읽기 락) 로 읽는다 */
+static void append_table(JsonBuf *buf, Engine *engine, int index)
 {
+    const Table *table = engine_table_at(engine, index);
     json_buf_append_text(buf, "{\"name\":");
     json_buf_append_escaped(buf, table_name(table), strlen(table_name(table)));
     json_buf_append_text(buf, ",\"columns\":[");
@@ -230,7 +231,7 @@ static void append_table(JsonBuf *buf, Engine *engine, const Table *table)
         json_buf_append_text(buf, "}");
     }
     json_buf_append_text(buf, "],\"row_count\":");
-    json_buf_append_int(buf, engine_record_count(engine, table));
+    json_buf_append_int(buf, engine_record_count(engine, index));
     json_buf_append_text(buf, "}");
 }
 
@@ -252,7 +253,7 @@ static void handle_tables(const Connection *conn, const HttpRequest *request)
     for (int i = 0; i < engine_table_count(engine); i++) {
         if (i > 0)
             json_buf_append_text(&buf, ",");
-        append_table(&buf, engine, engine_table_at(engine, i));
+        append_table(&buf, engine, i);
     }
     json_buf_append_text(&buf, "]}");
     send_buf(conn, &buf);

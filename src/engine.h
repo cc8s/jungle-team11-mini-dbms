@@ -32,10 +32,11 @@ const Table *engine_find_table(const Engine *engine, const char *name);
 int engine_table_count(const Engine *engine);
 const Table *engine_table_at(const Engine *engine, int index);
 
-/* table 의 현재 행 수. INSERT 와 동시에 불릴 수 있어서 실행 락을 잡고 읽는다 (/tables 용) */
-int32_t engine_record_count(Engine *engine, const Table *table);
+/* index 번째 테이블의 현재 행 수. INSERT 와 동시에 불릴 수 있어서 그 테이블의 읽기 락
+ * (GLOBAL 이면 엔진 뮤텍스) 을 잡고 읽는다 (/tables 용) */
+int32_t engine_record_count(Engine *engine, int index);
 
-/* 이 빌드의 락 방식 이름 ("GLOBAL") */
+/* 이 빌드의 락 방식 이름 ("GLOBAL" 또는 "TABLE_RW") */
 const char *engine_lock_mode_name(void);
 
 /* 여러 스레드가 같은 엔진으로 engine_execute 를 동시에 불러도 된다 (테이블을 읽고 쓰는 실행 단계는

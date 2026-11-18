@@ -624,7 +624,9 @@ static void test_stats_counts_requests(void)
           DEFAULT_TEST_QUEUE);
     CHECK(json_number(response.body, "workers") == DEFAULT_TEST_WORKERS);
     CHECK(json_number(response.body, "uptime_ms") >= 0);
-    CHECK(strstr(response.body, "\"lock_mode\":\"GLOBAL\"") != NULL);
+    char lock_mode[MAX_MESSAGE];
+    snprintf(lock_mode, sizeof(lock_mode), "\"lock_mode\":\"%s\"", engine_lock_mode_name());
+    CHECK(strstr(response.body, lock_mode) != NULL);
     stop_server(&ts);
 }
 
@@ -800,7 +802,7 @@ static void test_stop_while_insert_in_progress(void)
     CHECK(ts.db.engine != NULL);
     CHECK(engine_warning_count(ts.db.engine) == 0);
     CHECK(count_users(ts.db.engine) == 1);
-    CHECK(engine_record_count(ts.db.engine, engine_find_table(ts.db.engine, "users")) == 1);
+    CHECK(engine_record_count(ts.db.engine, 0) == 1); /* users 하나뿐 */
     test_db_destroy(&ts.db);
 }
 
