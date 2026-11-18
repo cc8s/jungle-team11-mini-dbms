@@ -13,11 +13,21 @@ enum result_type {
     RESULT_SELECT
 };
 
+/* SELECT 가 행을 찾은 방법 */
+enum result_plan {
+    RESULT_PLAN_SCAN,         /* 파일 전체 선형 탐색 */
+    RESULT_PLAN_INDEX_LOOKUP, /* B+ 트리 검색 (WHERE id = n) */
+    RESULT_PLAN_INDEX_RANGE   /* B+ 트리 + 리프 순회 (WHERE id BETWEEN) */
+};
+
 struct result {
     enum result_type type;
     long long inserted_id; /* INSERT */
+    double table_open_ms;  /* 이 문장이 테이블을 처음 열었으면 그 시간(인덱스 재구성 포함), 아니면 0 */
 
     /* SELECT */
+    enum result_plan plan;
+    size_t rows_examined; /* 조건을 확인한 행 수: 선형이면 전체, 인덱스면 찾은 것만 */
     const struct schema *schema;
     int column_count;
     int columns[SCHEMA_MAX_COLUMNS]; /* 출력할 컬럼의 스키마 위치, 출력 순서대로 */
@@ -35,6 +45,9 @@ const void *result_row(const struct result *r, size_t index);
 
 /* CLI 용 표:  id | name   (헤더) / 1 | kim  (행) / (1 row) */
 void result_print(const struct result *r, FILE *out);
+
+/* "index lookup" / "index range" / "full scan" */
+const char *result_plan_name(enum result_plan plan);
 
 void result_free(struct result *r);
 

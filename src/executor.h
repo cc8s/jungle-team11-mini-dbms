@@ -3,9 +3,14 @@
 
 /* Statement 를 스키마와 대조하고 실행한다. 테이블은 처음 쓸 때 열어 끝까지 둔다 (D002).
  *
- * Phase 1: WHERE 는 모두 선형 탐색. #6 에서 WHERE id 조건을 B+ 트리로 바꾼다 (D003). */
+ * 탐색 방법 (D003, D004):
+ *   WHERE id = n            → B+ 트리 검색      O(log N)
+ *   WHERE id BETWEEN a AND b → 트리 + 리프 순회  O(log N + K)
+ *   그 밖 (다른 컬럼, WHERE 없음) → 파일 선형 탐색 O(N)
+ * use_index 를 끄면 모두 선형 탐색이다 (비교 측정과 결과 대조용). */
 
 #include <pthread.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "parser.h"
@@ -18,6 +23,7 @@
 struct executor {
     char schema_dir[EXECUTOR_PATH_MAX];
     char data_dir[EXECUTOR_PATH_MAX];
+    bool use_index; /* 기본 참 */
     int table_count;
     struct table *tables[EXECUTOR_MAX_TABLES];
     pthread_mutex_t tables_lock; /* 테이블 목록 (열기) 보호. 행 접근은 테이블 락의 몫 */

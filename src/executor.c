@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "row.h"
 
@@ -28,14 +29,25 @@ int executor_init(struct executor *ex, const char *schema_dir, const char *data_
     }
     strcpy(ex->schema_dir, schema_dir);
     strcpy(ex->data_dir, data_dir);
+    ex->use_index = true;
     pthread_mutex_init(&ex->tables_lock, NULL);
     return 0;
 }
 
-/* 이미 연 테이블을 찾고, 없으면 연다 */
-static struct table *get_table(struct executor *ex, const char *name, char *err, size_t err_size)
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* 이미 연 테이블을 찾고, 없으면 연다. 이번에 열었으면 걸린 시간(인덱스 재구성 포함)을 *open_ms 에 */
+static struct table *get_table(struct executor *ex, const char *name, double *open_ms, char *err,
+                               size_t err_size)
 {
     struct table *found = NULL;
+    double start = now_ms();
 
     pthread_mutex_lock(&ex->tables_lock);
     for (int i = 0; i < ex->table_count; i++) {
@@ -55,6 +67,7 @@ static struct table *get_table(struct executor *ex, const char *name, char *err,
         } else {
             ex->tables[ex->table_count++] = t;
             found = t;
+            *open_ms = now_ms() - start;
         }
     }
     pthread_mutex_unlock(&ex->tables_lock);
@@ -168,7 +181,10 @@ struct select_ctx {
     const struct where_clause *where;
     int where_col;
     struct result *out;
+    struct storage *storage; /* 인덱스 경로에서 오프셋으로 행을 읽을 때 */
+    char *row_buf;
     bool is_oom;
+    bool has_read_error;
 };
 
 static bool row_matches(const struct select_ctx *c, const void *row)
@@ -195,6 +211,7 @@ static int collect_row(const void *row, uint64_t offset, void *ctx)
     struct select_ctx *c = ctx;
 
     (void)offset;
+    c->out->rows_examined++;
     if (!row_matches(c, row)) {
         return 0;
     }
@@ -203,6 +220,46 @@ static int collect_row(const void *row, uint64_t offset, void *ctx)
         return 1;
     }
     return 0;
+}
+
+/* 트리가 준 오프셋의 행을 읽어 담는다. 트리 범위가 곧 조건이라 다시 확인하지 않는다 */
+static int collect_indexed(long long key, uint64_t offset, void *ctx)
+{
+    struct select_ctx *c = ctx;
+
+    (void)key;
+    c->out->rows_examined++;
+    if (storage_read(c->storage, offset, c->row_buf) < 0) {
+        c->has_read_error = true;
+        return 1;
+    }
+    if (result_add_row(c->out, c->row_buf) < 0) {
+        c->is_oom = true;
+        return 1;
+    }
+    return 0;
+}
+
+/* WHERE 가 id(0번 컬럼) 조건이고 인덱스를 쓸 수 있으면 트리의 [low, high] 를 정한다 */
+static bool pick_index_range(const struct executor *ex, const struct table *t,
+                             const struct select_ctx *c, long long *low, long long *high)
+{
+    const struct where_clause *w = c->where;
+
+    if (!ex->use_index || !t->is_index_valid || c->where_col != 0) {
+        return false;
+    }
+    if (w->type == WHERE_EQUAL) {
+        *low = w->value.int_value;
+        *high = w->value.int_value;
+        return true;
+    }
+    if (w->type == WHERE_BETWEEN) {
+        *low = w->low;
+        *high = w->high;
+        return true;
+    }
+    return false;
 }
 
 static int resolve_select_columns(const struct schema *s, const struct statement *stmt,
@@ -246,11 +303,15 @@ static int check_where(const struct schema *s, const struct where_clause *w, int
     return check_type(s, *where_col, &w->value, err, err_size);
 }
 
-static int execute_select(struct table *t, const struct statement *stmt, struct result *out,
-                          char *err, size_t err_size)
+static int execute_select(struct executor *ex, struct table *t, const struct statement *stmt,
+                          struct result *out, char *err, size_t err_size)
 {
     const struct schema *s = &t->schema;
-    struct select_ctx ctx = {.schema = s, .where = &stmt->where, .out = out};
+    char row_buf[EXECUTOR_ROW_MAX];
+    struct select_ctx ctx = {
+        .schema = s, .where = &stmt->where, .out = out, .storage = &t->storage, .row_buf = row_buf};
+    long long low;
+    long long high;
 
     out->type = RESULT_SELECT;
     out->schema = s;
@@ -258,7 +319,17 @@ static int execute_select(struct table *t, const struct statement *stmt, struct 
         check_where(s, &stmt->where, &ctx.where_col, err, err_size) < 0) {
         return -1;
     }
-    if (storage_scan(&t->storage, collect_row, &ctx) < 0) {
+
+    int rc;
+    if (pick_index_range(ex, t, &ctx, &low, &high)) {
+        out->plan = low == high ? RESULT_PLAN_INDEX_LOOKUP : RESULT_PLAN_INDEX_RANGE;
+        bptree_range(&t->index, low, high, collect_indexed, &ctx);
+        rc = ctx.has_read_error ? -1 : 0;
+    } else {
+        out->plan = RESULT_PLAN_SCAN;
+        rc = storage_scan(&t->storage, collect_row, &ctx);
+    }
+    if (rc < 0) {
         result_free(out);
         return fail(err, err_size, "read failed");
     }
@@ -273,14 +344,14 @@ int executor_execute(struct executor *ex, const struct statement *stmt, struct r
                      char *err, size_t err_size)
 {
     result_init(out);
-    struct table *t = get_table(ex, stmt->table, err, err_size);
+    struct table *t = get_table(ex, stmt->table, &out->table_open_ms, err, err_size);
     if (!t) {
         return -1;
     }
     if (stmt->type == STATEMENT_INSERT) {
         return execute_insert(t, stmt, out, err, err_size);
     }
-    return execute_select(t, stmt, out, err, err_size);
+    return execute_select(ex, t, stmt, out, err, err_size);
 }
 
 void executor_close(struct executor *ex)

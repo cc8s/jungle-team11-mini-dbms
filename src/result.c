@@ -72,6 +72,19 @@ void result_print(const struct result *r, FILE *out)
     fprintf(out, "(%zu %s)\n", r->row_count, r->row_count == 1 ? "row" : "rows");
 }
 
+const char *result_plan_name(enum result_plan plan)
+{
+    switch (plan) {
+    case RESULT_PLAN_INDEX_LOOKUP:
+        return "index lookup";
+    case RESULT_PLAN_INDEX_RANGE:
+        return "index range";
+    case RESULT_PLAN_SCAN:
+    default:
+        return "full scan";
+    }
+}
+
 void result_free(struct result *r)
 {
     free(r->rows);
