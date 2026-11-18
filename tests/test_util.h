@@ -7,6 +7,7 @@
 /* nftw, mkdtemp 는 Makefile 의 -D_GNU_SOURCE 로 선언이 보인다 */
 #include <ftw.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,28 @@ static inline int remove_visited_entry(const char *path, const struct stat *info
 static inline bool test_remove_dir(const char *path)
 {
     return nftw(path, remove_visited_entry, TEST_NFTW_OPEN_FDS, FTW_DEPTH | FTW_PHYS) == 0;
+}
+
+/* 퍼징용 의사 난수 (xorshift64*). 시드를 고정하면 매번 같은 입력이 나와서 실패를 다시 만들 수 있다.
+ * rand() 는 숨은 전역 상태를 써서 쓰지 않는다 (check-banned). 상태는 호출한 쪽 구조체에 있다 */
+typedef struct {
+    uint64_t state; /* 0 이 아니어야 한다 */
+} TestRng;
+
+#define TEST_RNG_MULTIPLIER 2685821657736338717ULL
+
+static inline uint64_t test_rng_next(TestRng *rng)
+{
+    rng->state ^= rng->state >> 12;
+    rng->state ^= rng->state << 25;
+    rng->state ^= rng->state >> 27;
+    return rng->state * TEST_RNG_MULTIPLIER;
+}
+
+/* 0 이상 bound 미만 (bound > 0) */
+static inline size_t test_rng_below(TestRng *rng, size_t bound)
+{
+    return (size_t)(test_rng_next(rng) % bound);
 }
 
 /* 출력 캡처: open_memstream 이 text/len 의 주소를 기억해 두고 키워 가며 쓰므로

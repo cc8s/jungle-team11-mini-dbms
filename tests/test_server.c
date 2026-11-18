@@ -959,6 +959,83 @@ static void test_load_through_server(void)
     stop_server(&ts);
 }
 
+/* ---- S43 무작위 요청 ---- */
+
+#define RANDOM_REQUESTS 1000
+#define RANDOM_SEED 0x5eed0043ULL
+#define RANDOM_MAX_LEN 512
+#define RANDOM_KINDS 3
+#define RANDOM_BYTE_VALUES 256
+#define RANDOM_READ_SIZE 4096
+#define CONNECTION_CLOSED 0 /* 응답 없이 닫힘 */
+#define RANDOM_HEAD_PREFIX "POST /query HTTP/1.1\r\n"
+#define RANDOM_BODY_FORMAT "POST /query HTTP/1.1\r\nContent-Length: %zu\r\n\r\n"
+
+/* 세 종류를 섞는다: 순수 무작위, 요청 줄 뒤에 무작위 헤더, 올바른 헤더 뒤에 무작위 본문 */
+static size_t make_random_request(TestRng *rng, int kind, char *out, size_t capacity)
+{
+    size_t random_len = 1 + test_rng_below(rng, RANDOM_MAX_LEN);
+    size_t len = 0;
+    if (kind == 1)
+        len = (size_t)snprintf(out, capacity, "%s", RANDOM_HEAD_PREFIX);
+    else if (kind == 2)
+        len = (size_t)snprintf(out, capacity, RANDOM_BODY_FORMAT, random_len);
+    for (size_t i = 0; i < random_len && len < capacity; i++)
+        out[len++] = (char)test_rng_below(rng, RANDOM_BYTE_VALUES);
+    return len;
+}
+
+/* 보내고 쓰기 쪽을 닫은 뒤 서버가 닫을 때까지 읽는다. 상태 코드, 응답 없이 닫혔으면 0.
+ * 서버가 먼저 거절하고 닫으면 쓰기·읽기가 EPIPE/ECONNRESET 일 수 있는데, 이것도 연결 종료로 본다 */
+static int send_raw(int port, const char *bytes, size_t len)
+{
+    int fd = connect_to(port);
+    (void)send(fd, bytes, len, MSG_NOSIGNAL);
+    shutdown(fd, SHUT_WR);
+    char head[RANDOM_READ_SIZE];
+    size_t head_len = 0;
+    char discard[RANDOM_READ_SIZE];
+    for (;;) {
+        char *into = head_len < sizeof(head) - 1 ? head + head_len : discard;
+        size_t room = head_len < sizeof(head) - 1 ? sizeof(head) - 1 - head_len : sizeof(discard);
+        ssize_t n = read(fd, into, room);
+        if (n <= 0)
+            break;
+        if (into == head)
+            head_len += (size_t)n;
+    }
+    close(fd);
+    head[head_len] = '\0';
+    int status = CONNECTION_CLOSED;
+    if (head_len > 0)
+        CHECK(sscanf(head, "HTTP/1.1 %d", &status) == 1);
+    return status;
+}
+
+/* E43-06 */
+static void test_random_requests(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    TestRng rng = { .state = RANDOM_SEED };
+    char request[RANDOM_MAX_LEN + REQUEST_HEAD_SIZE];
+    int answered = 0;
+    for (int i = 0; i < RANDOM_REQUESTS; i++) {
+        size_t len = make_random_request(&rng, i % RANDOM_KINDS, request, sizeof(request));
+        int status = send_raw(ts.port, request, len);
+        CHECK(status == CONNECTION_CLOSED || (status >= 400 && status < 500));
+        answered += status != CONNECTION_CLOSED;
+    }
+    CHECK(answered > 0);
+    Response response;
+    send_request(ts.port, HEALTH_REQUEST, &response); /* 서버는 계속 동작한다 */
+    CHECK(response.status == 200);
+    post_query(ts.port, "{\"sql\":\"INSERT INTO users VALUES ('kim', 25)\"}", &response);
+    CHECK(response.status == 200);
+    CHECK(engine_record_count(ts.db.engine, 0) == 1); /* 무작위 요청으로는 아무것도 삽입되지 않았다 */
+    stop_server(&ts);
+}
+
 int main(void)
 {
     printf("test_server\n");
@@ -993,6 +1070,7 @@ int main(void)
     RUN(test_stop_answers_queued_requests);
     RUN(test_sigint_twice_shuts_down_cleanly);
     RUN(test_load_through_server);
+    RUN(test_random_requests);
     TEST_DONE();
     return 0;
 }

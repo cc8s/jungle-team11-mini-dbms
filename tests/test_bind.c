@@ -1,6 +1,7 @@
 #include "test.h"
 #include "test_util.h"
 
+#include "cli.h"
 #include "engine_internal.h"
 
 /* Prepared Statement 바인딩: SQL 의 ? 자리에 params 의 값을 넣는다. 값은 토크나이저·파서를 거치지 않고
@@ -304,6 +305,173 @@ static void test_script_placeholder_is_param_error(void)
     test_db_destroy(&db);
 }
 
+/* ==== S43 인젝션 시연과 큰 입력 ==== */
+
+/* 이름 검색 입력칸에 공격자가 넣는 값. 이어 붙이면 '...' 를 닫고 INSERT 를 덧붙인 뒤 남은 ' 를 주석으로 지운다 */
+#define ATTACK "kim'; INSERT INTO users VALUES ('hacker', 99); --"
+#define CONCAT_PREFIX "SELECT * FROM users WHERE name = '"
+#define CONCAT_SUFFIX "'"
+#define HUGE_LEN 65536
+#define QUOTE_COUNT 10000
+#define CLI_EXIT_OK 0
+
+/* 개발자가 문자열 이어 붙이기로 만든 SQL (하면 안 되는 방식) */
+static char *concat_query(const char *input)
+{
+    size_t len = strlen(CONCAT_PREFIX) + strlen(input) + strlen(CONCAT_SUFFIX);
+    char *sql = malloc(len + 1);
+    CHECK(sql != NULL);
+    snprintf(sql, len + 1, "%s%s%s", CONCAT_PREFIX, input, CONCAT_SUFFIX);
+    return sql;
+}
+
+static int64_t count_named(Engine *engine, const char *name)
+{
+    Params params = { 0 };
+    add_text(&params, name);
+    Result result = run_bound(engine, "SELECT * FROM users WHERE name = ?", &params);
+    CHECK(result.error == ERR_NONE);
+    int64_t count = result.row_count;
+    result_free(&result);
+    return count;
+}
+
+/* T43-01: 바인딩하면 공격 문자열 전체가 이름 하나다. 그런 이름은 없으므로 0 행, 삽입 없음 */
+static void test_injection_with_binding_is_data(void)
+{
+    TestDb db = open_db();
+    insert_user(db.engine, "kim", 25);
+    CHECK(count_named(db.engine, ATTACK) == 0); /* 'kim' 이 있어도 'kim' 으로 끊기지 않는다 */
+    CHECK(user_count(db.engine) == 1);
+    CHECK(count_named(db.engine, "hacker") == 0);
+    test_db_destroy(&db);
+}
+
+/* T43-02: 이어 붙이면 SQL 이 두 문장이 된다. API 의 한 문장 제한이 2 차 방어선으로 막는다 */
+static void test_injection_by_concat_blocked_by_single_statement(void)
+{
+    TestDb db = open_db();
+    insert_user(db.engine, "kim", 25);
+    char *sql = concat_query(ATTACK);
+    Result result = engine_execute(db.engine, sql, NULL, 0);
+    CHECK(result.error == ERR_UNSUPPORTED); /* 첫 SELECT 도 실행되지 않는다 */
+    CHECK(result.row_count == 0);
+    result_free(&result);
+    free(sql);
+    CHECK(user_count(db.engine) == 1);
+    CHECK(count_named(db.engine, "hacker") == 0);
+    test_db_destroy(&db);
+}
+
+/* T43-03: CLI 스크립트 모드는 여러 문장을 허용한다. 같은 이어 붙이기가 여기서는 통한다 (대조군) */
+static void test_injection_by_concat_succeeds_in_script_mode(void)
+{
+    TestDb db = open_db();
+    insert_user(db.engine, "kim", 25);
+    engine_close(db.engine); /* CLI 가 같은 디렉터리를 따로 연다 */
+    db.engine = NULL;
+
+    char *sql = concat_query(ATTACK);
+    char path[TEST_PATH_MAX];
+    CHECK(test_write_file(db.dir, "attack.sql", sql, path));
+    free(sql);
+    char *argv[] = { "minidb", "-d", db.dir, "-q", path };
+    TestCapture out;
+    TestCapture err;
+    test_capture_open(&out);
+    test_capture_open(&err);
+    CHECK(cli_run((int)(sizeof(argv) / sizeof(argv[0])), argv, out.stream, err.stream) ==
+          CLI_EXIT_OK);
+    free(test_capture_close(&out));
+    free(test_capture_close(&err));
+
+    test_db_reopen(&db);
+    CHECK(db.engine != NULL);
+    CHECK(count_named(db.engine, "hacker") == 1); /* 공격이 성공했다: 바인딩을 써야 하는 이유 */
+    CHECK(user_count(db.engine) == 2);
+    test_db_destroy(&db);
+}
+
+/* E43-05: 주석으로 뒷부분을 지우려는 값도 바인딩하면 그 글자 그대로 */
+static void test_comment_in_param_is_data(void)
+{
+    TestDb db = open_db();
+    int32_t id = insert_user(db.engine, "'x' --", 1);
+    CHECK(count_named(db.engine, "'x' --") == 1);
+    Params params = { 0 };
+    add_int(&params, id);
+    Result result = run_bound(db.engine, "SELECT * FROM users WHERE id = ?", &params);
+    CHECK(result.error == ERR_NONE);
+    check_name(&result, 0, "'x' --");
+    result_free(&result);
+    test_db_destroy(&db);
+}
+
+/* ch 를 count 번 반복한 문자열 (호출한 쪽이 free) */
+static char *repeat_char(char ch, size_t count)
+{
+    char *text = malloc(count + 1);
+    CHECK(text != NULL);
+    memset(text, ch, count);
+    text[count] = '\0';
+    return text;
+}
+
+static ErrorCode run_prefixed(Engine *engine, const char *prefix, const char *body)
+{
+    size_t len = strlen(prefix) + strlen(body);
+    char *sql = malloc(len + 1);
+    CHECK(sql != NULL);
+    snprintf(sql, len + 1, "%s%s", prefix, body);
+    Result result = engine_execute(engine, sql, NULL, 0);
+    ErrorCode error = result.error;
+    result_free(&result);
+    free(sql);
+    return error;
+}
+
+/* E43-01: 64KB 식별자는 식별자 길이 (31 바이트) 검사에서 먼저 걸려 문법 에러. 같은 길이를 문자열
+ * 리터럴로 넣으면 문장 크기 제한 (64KB) 에 걸린다. 바인딩 값이면 컬럼 길이 검사에 걸린다 */
+static void test_huge_identifier(void)
+{
+    TestDb db = open_db();
+    char *huge = repeat_char('a', HUGE_LEN);
+    CHECK(run_prefixed(db.engine, "SELECT * FROM ", huge) == ERR_SYNTAX);
+    char *literal = malloc(HUGE_LEN + 3);
+    CHECK(literal != NULL);
+    snprintf(literal, HUGE_LEN + 3, "'%s'", huge);
+    CHECK(run_prefixed(db.engine, "SELECT * FROM users WHERE name = ", literal) == ERR_TOO_LARGE);
+    free(literal);
+    huge[HUGE_LEN / 2] = '\0'; /* 32KB: 문장 제한 안쪽 */
+    CHECK(run_prefixed(db.engine, "SELECT * FROM ", huge) == ERR_SYNTAX);
+
+    CHECK(count_named(db.engine, huge) == 0); /* WHERE 값으로는 그냥 맞는 행이 없다 */
+    Params params = { 0 };
+    add_text(&params, huge);
+    add_int(&params, 1);
+    CHECK(run_bound_error(db.engine, "INSERT INTO users VALUES (?, ?)", &params) ==
+          ERR_VALUE_TOO_LONG);
+    free(huge);
+    CHECK(user_count(db.engine) == 0);
+    test_db_destroy(&db);
+}
+
+/* E43-02: 따옴표 1 만 개. 짝수 개면 '' 이스케이프가 이어진 문자열 하나, 홀수 개면 닫히지 않은 문자열 */
+static void test_ten_thousand_quotes(void)
+{
+    TestDb db = open_db();
+    char *quotes = repeat_char('\'', QUOTE_COUNT + 1);
+    const char *prefix = "SELECT * FROM users WHERE name = ";
+    CHECK(run_prefixed(db.engine, prefix, quotes) == ERR_SYNTAX); /* 홀수: 닫히지 않음 */
+    quotes[QUOTE_COUNT] = '\0';
+    CHECK(run_prefixed(db.engine, prefix, quotes) == ERR_NONE); /* 짝수: 따옴표 4999 개짜리 값 */
+    CHECK(run_prefixed(db.engine, "", quotes) == ERR_SYNTAX);  /* 문장 자리에 따옴표만 */
+    CHECK(count_named(db.engine, quotes) == 0);                 /* 바인딩: 따옴표 1 만 개짜리 이름 */
+    free(quotes);
+    CHECK(user_count(db.engine) == 0);
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     printf("test_bind\n");
@@ -319,6 +487,12 @@ int main(void)
     RUN(test_placeholder_outside_value_position);
     RUN(test_two_statements_rejected);
     RUN(test_script_placeholder_is_param_error);
+    RUN(test_injection_with_binding_is_data);
+    RUN(test_injection_by_concat_blocked_by_single_statement);
+    RUN(test_injection_by_concat_succeeds_in_script_mode);
+    RUN(test_comment_in_param_is_data);
+    RUN(test_huge_identifier);
+    RUN(test_ten_thousand_quotes);
     TEST_DONE();
     return 0;
 }
