@@ -1,0 +1,5 @@
+# users 테이블. 첫 컬럼 id 는 INSERT 때 자동으로 부여된다.
+id INT
+name VARCHAR(32)
+email VARCHAR(64)
+age INT
