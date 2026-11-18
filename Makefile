@@ -15,7 +15,7 @@ TESTS    := $(patsubst tests/%.c, $(TBIN)/%, $(wildcard tests/test_*.c))
 ASAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1
 TSAN_FLAGS := -fsanitize=thread -O1
 
-.PHONY: all test sqltest servertest servertest-tsan asan tsan run clean
+.PHONY: all test sqltest servertest servertest-tsan asan tsan bench run clean
 
 all: $(BIN)
 
@@ -63,10 +63,19 @@ asan:
 tsan:
 	$(MAKE) test BUILD=build/tsan TBIN=tests/bin/tsan EXTRA_CFLAGS="$(TSAN_FLAGS)" EXTRA_LDFLAGS="$(TSAN_FLAGS)"
 
+# 100만 건 생성기 (외부 의존 없음)
+tools/gen_data: tools/gen_data.c
+	$(CC) -std=c11 -Wall -Wextra -O2 $< -o $@
+
+# 100만 건 벤치마크 (#8): make bench ROWS=1000000
+ROWS ?= 1000000
+bench: $(BIN) tools/gen_data
+	bash bench/run_bench.sh $(ROWS)
+
 run: $(BIN)
 	./$(BIN)
 
 clean:
-	rm -rf build tests/bin $(BIN)
+	rm -rf build tests/bin $(BIN) tools/gen_data
 
 -include $(wildcard $(BUILD)/*.d)
