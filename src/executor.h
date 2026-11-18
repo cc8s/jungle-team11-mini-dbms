@@ -31,7 +31,8 @@ struct executor {
 
 int executor_init(struct executor *ex, const char *schema_dir, const char *data_dir);
 
-/* 성공 0 (out 을 채움, 다 쓰면 result_free), 실패 -1 (err 에 이유). */
+/* 성공 0 (out 을 채움, 다 쓰면 result_free), 실패 -1 (err 에 이유).
+ * 여러 스레드가 같은 실행기로 동시에 불러도 된다: 테이블별 rwlock 으로 INSERT 는 혼자, SELECT 는 함께 (D005). */
 int executor_execute(struct executor *ex, const struct statement *stmt, struct result *out,
                      char *err, size_t err_size);
 

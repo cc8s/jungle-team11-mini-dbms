@@ -1,9 +1,15 @@
 #ifndef MINI_DBMS_TABLE_H
 #define MINI_DBMS_TABLE_H
 
-/* 테이블 하나 = 스키마 + 저장소 파일 + id 인덱스(B+ 트리). 실행기가 처음 쓸 때 연다.
- * id 발급(next_id)도 여기서 한다. 동시성은 #10 에서 테이블 rwlock 을 붙인다 (D005). */
+/* 테이블 하나 = 스키마 + 저장소 파일 + id 인덱스(B+ 트리) + rwlock. 실행기가 처음 쓸 때 연다.
+ * id 발급(next_id)도 여기서 한다.
+ *
+ * 동시성 (D005, 학습 노트 2 Q8·Q9):
+ *   INSERT 는 쓰기 락 안에서 id 읽기 → 파일 쓰기 → 트리 삽입 → next_id 증가를 통째로 한다.
+ *   SELECT 는 읽기 락이라 여럿이 함께 돈다. 저장소 읽기는 pread 라 파일 위치를 공유하지 않는다 (D008).
+ *   rwlock 은 쓰기 우선으로 만든다. glibc 기본은 읽기 우선이라 SELECT 가 끊임없으면 INSERT 가 굶는다 */
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -16,6 +22,7 @@ struct table {
     struct storage storage;
     struct bptree index;  /* id → 행 오프셋. 메모리에만 있고 열 때 다시 만든다 (D003) */
     bool is_index_valid;  /* 거짓이면 실행기는 인덱스 대신 선형 탐색을 쓴다 */
+    pthread_rwlock_t lock; /* 위의 storage·index·is_index_valid 를 지킨다. 잡는 쪽은 실행기 */
 };
 
 /* schema_dir/<name>.schema 를 읽고 data_dir/<name>.tbl 을 연다(없으면 만든다).

@@ -85,6 +85,12 @@ int table_open(struct table *t, const char *schema_dir, const char *data_dir, co
         storage_close(&t->storage);
         return -1;
     }
+
+    pthread_rwlockattr_t attr;
+    pthread_rwlockattr_init(&attr);
+    pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    pthread_rwlock_init(&t->lock, &attr);
+    pthread_rwlockattr_destroy(&attr);
     return 0;
 }
 
@@ -111,4 +117,5 @@ void table_close(struct table *t)
 {
     storage_close(&t->storage);
     bptree_free(&t->index);
+    pthread_rwlock_destroy(&t->lock);
 }
