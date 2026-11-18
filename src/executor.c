@@ -348,10 +348,19 @@ int executor_execute(struct executor *ex, const struct statement *stmt, struct r
     if (!t) {
         return -1;
     }
+
+    /* INSERT 는 id 발급부터 파일·트리 반영까지 통째로 쓰기 락 안에서 (Q8 경쟁 조건).
+     * SELECT 는 읽기 락: 함께 돌아도 되고, INSERT 도중의 반쯤 바뀐 트리는 보지 않는다 (Q9) */
+    int rc;
     if (stmt->type == STATEMENT_INSERT) {
-        return execute_insert(t, stmt, out, err, err_size);
+        pthread_rwlock_wrlock(&t->lock);
+        rc = execute_insert(t, stmt, out, err, err_size);
+    } else {
+        pthread_rwlock_rdlock(&t->lock);
+        rc = execute_select(ex, t, stmt, out, err, err_size);
     }
-    return execute_select(ex, t, stmt, out, err, err_size);
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
 }
 
 void executor_close(struct executor *ex)
