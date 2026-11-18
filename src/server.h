@@ -5,6 +5,7 @@
  * accept 루프 (server_run) 는 호출한 스레드에서 돌고, 요청 처리는 풀의 워커가 한다.
  * 테스트는 server_run 을 스레드로 띄우고 server_stop 으로 멈춘다. 엔진은 호출한 쪽이 열고 닫는다. */
 
+#include <signal.h>
 #include <stdint.h>
 
 #include "common.h"
@@ -39,6 +40,13 @@ void server_run(Server *server);
 
 /* 다른 스레드에서 accept 루프를 깨워 멈추게 한다. 여러 번 불러도 안전하다 */
 void server_stop(Server *server);
+
+/* 시그널로도 멈추게 한다 (serve 명령). server_run 전에 부른다.
+ * 호출한 쪽은 SIGINT/SIGTERM 을 모든 스레드에서 막아 두고 (워커를 만들기 전에), 핸들러가 *stop_flag 를
+ * 1 로 바꾸게 한다. accept 루프는 ppoll 로 기다리는 동안만 wait_mask 를 써서 그 시그널을 받고,
+ * EINTR 로 깨어나면 *stop_flag 를 확인해 server_stop 과 같은 종료 경로를 탄다 */
+void server_watch_signals(Server *server, const sigset_t *wait_mask,
+                          volatile sig_atomic_t *stop_flag);
 
 /* server_run 이 돌아온 뒤 (또는 돌리지 않았으면 바로) 자원을 해제한다. NULL 이면 아무 일도 없다 */
 void server_destroy(Server *server);

@@ -3,16 +3,22 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "cli.h"
 #include "server.h"
+#include "server_internal.h"
 #include "table_internal.h"
+#include "threadpool.h"
 
 #define LOCALHOST "127.0.0.1"
 #define RESPONSE_CAPACITY 65536
@@ -700,6 +706,181 @@ static void test_stats_under_load(void)
     stop_server(&ts);
 }
 
+/* ---- S39 우아한 종료 ---- */
+
+#define INSERT_BODY "{\"sql\":\"INSERT INTO users VALUES ('kim', 25)\"}"
+#define INSERT_HEAD_FORMAT "POST /query HTTP/1.1\r\nContent-Length: %zu\r\n\r\n"
+#define LINE_SIZE 256
+
+/* accept 루프가 연결 accepted 개를 받았고 큐에 queued 개가 남았을 때까지 기다린다.
+ * 시간에 기대지 않고 서버 상태를 직접 본다 (워커가 연결을 꺼내 갔는지 = 받은 수 - 큐 길이) */
+static void wait_for_server_state(Server *server, int64_t accepted, int queued)
+{
+    while (atomic_load(&server->accepted_total) < accepted ||
+           threadpool_queue_length(server->pool) != queued)
+        sched_yield();
+}
+
+/* INSERT 요청의 헤더만 보내 둔 연결 (본문은 finish_insert 로). 워커는 본문을 기다리며 붙잡힌다 */
+static int start_insert(int port)
+{
+    int fd = connect_to(port);
+    char head[REQUEST_HEAD_SIZE];
+    int len = snprintf(head, sizeof(head), INSERT_HEAD_FORMAT, strlen(INSERT_BODY));
+    CHECK(write(fd, head, (size_t)len) == len);
+    return fd;
+}
+
+static void finish_insert(int fd, Response *out)
+{
+    CHECK(write(fd, INSERT_BODY, strlen(INSERT_BODY)) == (ssize_t)strlen(INSERT_BODY));
+    read_response(fd, out);
+    close(fd);
+}
+
+static int count_users(Engine *engine)
+{
+    Result result = engine_execute(engine, "SELECT * FROM users", NULL, 0);
+    CHECK(result.error == ERR_NONE);
+    int count = (int)result.row_count;
+    result_free(&result);
+    return count;
+}
+
+/* 서버를 멈추게 하고 (server_stop), 같은 경로로 종료가 끝나는 것을 기다린다 */
+static void stop_and_join(TestServer *ts)
+{
+    server_stop(ts->server);
+    CHECK(pthread_join(ts->thread, NULL) == 0);
+    server_destroy(ts->server);
+}
+
+/* T39-01 */
+static void test_stop_idle_server(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    stop_and_join(&ts); /* 멈추지 않으면 join 이 돌아오지 않는다. 누수는 ASan 빌드가 본다 */
+    test_db_destroy(&ts.db);
+}
+
+/* T39-02, E39-02, E39-03 */
+static void test_stop_while_insert_in_progress(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    int fd = start_insert(ts.port);
+    wait_for_server_state(ts.server, 1, 0); /* 워커가 이 연결을 잡고 본문을 기다린다 */
+    server_stop(ts.server);
+
+    /* E39-02: 종료가 시작되면 listen 소켓이 닫혀 새 연결은 거부된다 */
+    for (;;) {
+        int probe = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((uint16_t)ts.port)};
+        inet_pton(AF_INET, LOCALHOST, &address.sin_addr);
+        int connected = connect(probe, (struct sockaddr *)&address, sizeof(address));
+        int saved_errno = errno;
+        close(probe);
+        if (connected < 0) {
+            /* listen 이 닫힌 뒤면 REFUSED, 닫히는 순간 backlog 에 들어갔다 끊긴 연결이면 RESET.
+             * 둘 다 새 연결을 받지 않았다는 뜻이다 */
+            CHECK(saved_errno == ECONNREFUSED || saved_errno == ECONNRESET);
+            break;
+        }
+        sched_yield(); /* 아직 accept 루프가 깨어나기 전 */
+    }
+
+    Response response;
+    finish_insert(fd, &response); /* 처리 중이던 요청은 끝까지 응답받는다 */
+    CHECK(response.status == 200);
+    CHECK(pthread_join(ts.thread, NULL) == 0);
+    server_destroy(ts.server);
+
+    test_db_reopen(&ts.db); /* E39-03: 다시 열어도 헤더와 데이터가 맞다 (복구 경고 없음) */
+    CHECK(ts.db.engine != NULL);
+    CHECK(engine_warning_count(ts.db.engine) == 0);
+    CHECK(count_users(ts.db.engine) == 1);
+    CHECK(engine_record_count(ts.db.engine, engine_find_table(ts.db.engine, "users")) == 1);
+    test_db_destroy(&ts.db);
+}
+
+/* E39-01 */
+static void test_stop_answers_queued_requests(void)
+{
+    ServerOptions options = server_default_options();
+    options.worker_count = 1;
+    TestServer ts;
+    start_server_on(&ts, &options, USERS_SQL);
+    int busy_fd = start_insert(ts.port);     /* 하나뿐인 워커를 붙잡는다 */
+    wait_for_server_state(ts.server, 1, 0);
+    int queued_fd = start_insert(ts.port);   /* 큐에서 기다린다 */
+    CHECK(write(queued_fd, INSERT_BODY, strlen(INSERT_BODY)) == (ssize_t)strlen(INSERT_BODY));
+    wait_for_server_state(ts.server, 2, 1);
+    server_stop(ts.server);
+
+    Response response;
+    finish_insert(busy_fd, &response);
+    CHECK(response.status == 200);
+    read_response(queued_fd, &response); /* 큐에 있던 요청도 종료 전에 처리된다 */
+    close(queued_fd);
+    CHECK(response.status == 200);
+    CHECK(pthread_join(ts.thread, NULL) == 0);
+    server_destroy(ts.server);
+    test_db_reopen(&ts.db);
+    CHECK(count_users(ts.db.engine) == 2);
+    test_db_destroy(&ts.db);
+}
+
+/* 자식 프로세스의 "minidb: listening on port N" 줄에서 포트를 읽는다 */
+static int read_child_port(FILE *child_out)
+{
+    char line[LINE_SIZE];
+    CHECK(fgets(line, sizeof(line), child_out) != NULL);
+    int port = 0;
+    CHECK(sscanf(line, "minidb: listening on port %d", &port) == 1);
+    return port;
+}
+
+/* E39-04: 실제 serve 명령을 자식 프로세스로 띄우고 SIGINT 를 두 번 보낸다. 시그널 처리는 프로세스
+ * 전체에 걸리므로 테스트 프로세스와 분리한다 (fork 시점에는 테스트 스레드가 하나뿐이다) */
+static void test_sigint_twice_shuts_down_cleanly(void)
+{
+    TestDb db = test_db_create(USERS_SQL);
+    CHECK(db.engine != NULL);
+    engine_close(db.engine);
+    db.engine = NULL;
+    int pipe_fds[2];
+    CHECK(pipe(pipe_fds) == 0);
+    fflush(stdout);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        close(pipe_fds[0]);
+        FILE *out = fdopen(pipe_fds[1], "w");
+        char *argv[] = {"minidb", "-d", db.dir, "serve", "0", "2", NULL};
+        _exit(cli_run(6, argv, out, stderr));
+    }
+    close(pipe_fds[1]);
+    FILE *child_out = fdopen(pipe_fds[0], "r");
+    CHECK(child_out != NULL);
+    int port = read_child_port(child_out);
+    Response response;
+    post_query(port, INSERT_BODY, &response);
+    CHECK(response.status == 200);
+
+    CHECK(kill(child, SIGINT) == 0);
+    CHECK(kill(child, SIGINT) == 0); /* 두 번째는 종료 중에 오거나 보류된다: 크래시 없음 */
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == CLI_EXIT_OK); /* 시그널로 죽지 않고 정상 종료 */
+    fclose(child_out);
+
+    test_db_reopen(&db);
+    CHECK(engine_warning_count(db.engine) == 0);
+    CHECK(count_users(db.engine) == 1);
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     printf("test_server\n");
@@ -728,6 +909,10 @@ int main(void)
     RUN(test_stats_counts_requests);
     RUN(test_stats_counts_errors_and_rejections);
     RUN(test_stats_under_load);
+    RUN(test_stop_idle_server);
+    RUN(test_stop_while_insert_in_progress);
+    RUN(test_stop_answers_queued_requests);
+    RUN(test_sigint_twice_shuts_down_cleanly);
     TEST_DONE();
     return 0;
 }

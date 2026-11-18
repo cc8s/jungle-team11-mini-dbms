@@ -2,6 +2,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -272,6 +274,69 @@ static bool parse_serve_options(const CliOptions *options, ServerOptions *out_se
                              &out_server->queue_capacity);
 }
 
+/* SIGINT/SIGTERM 을 받았는지. 시그널 핸들러는 인자를 받지 못해서 전역일 수밖에 없는 유일한 상태다
+ * (CLAUDE.md 의 전역 금지 규칙의 예외). 핸들러는 이 값만 바꾼다: async-signal-safe 하게,
+ * 락·malloc·출력 없이. 실제 종료는 accept 루프가 ppoll 의 EINTR 로 깨어나 이 값을 보고 한다 */
+static volatile sig_atomic_t serve_stop_requested = 0;
+
+static void request_serve_stop(int signal_number)
+{
+    (void)signal_number;
+    serve_stop_requested = 1;
+}
+
+/* 서버가 도는 동안의 시그널 설정. 끝나면 이전 상태로 되돌린다 */
+typedef struct {
+    sigset_t old_mask;
+    struct sigaction old_int;
+    struct sigaction old_term;
+} SignalState;
+
+/* 두 시그널을 이 스레드에서 막고 (이후 만드는 워커는 이 마스크를 물려받아 시그널을 받지 않는다),
+ * 핸들러를 SA_RESTART 없이 단다. *out_wait_mask 는 accept 루프가 기다릴 때 쓸, 둘만 푼 마스크 */
+static void install_serve_signals(SignalState *state, sigset_t *out_wait_mask)
+{
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, &state->old_mask);
+    *out_wait_mask = state->old_mask;
+    sigdelset(out_wait_mask, SIGINT);
+    sigdelset(out_wait_mask, SIGTERM);
+    serve_stop_requested = 0;
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = request_serve_stop;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0; /* SA_RESTART 없음: 대기 중인 시스템 콜이 EINTR 로 돌아온다 */
+    sigaction(SIGINT, &action, &state->old_int);
+    sigaction(SIGTERM, &action, &state->old_term);
+}
+
+/* 마스크를 먼저 되돌린다: 종료 중에 온 두 번째 SIGINT 가 보류돼 있었다면 여기서 우리 핸들러로
+ * 전달되어 무해하게 끝난다. 핸들러를 먼저 되돌리면 그 시그널이 기본 동작 (프로세스 종료) 이 된다 */
+static void restore_serve_signals(const SignalState *state)
+{
+    pthread_sigmask(SIG_SETMASK, &state->old_mask, NULL);
+    sigaction(SIGINT, &state->old_int, NULL);
+    sigaction(SIGTERM, &state->old_term, NULL);
+}
+
+/* 서버를 띄우고 시그널이나 server_stop 으로 멈출 때까지 돈다. 종료 순서 (계획서 7 장):
+ * listen 닫기 → 큐에 남은 요청 처리 후 워커 join (server_run 안) → 엔진 닫기 (호출한 쪽) */
+static void serve_until_stopped(Server *server, const ServerOptions *options,
+                                const sigset_t *wait_mask, FILE *out)
+{
+    server_watch_signals(server, wait_mask, &serve_stop_requested);
+    fprintf(out, "minidb: listening on port %d (workers %d, queue %d)\n", server_port(server),
+            options->worker_count, options->queue_capacity);
+    fflush(out);
+    server_run(server);
+    fprintf(out, "minidb: stopped\n");
+    fflush(out);
+}
+
 static int run_serve(const CliOptions *options, FILE *out, FILE *err)
 {
     ServerOptions server_options;
@@ -290,19 +355,21 @@ static int run_serve(const CliOptions *options, FILE *out, FILE *err)
     }
     for (int i = 0; i < engine_warning_count(engine); i++)
         fprintf(err, "minidb: warning: %s\n", engine_warning(engine, i));
+    SignalState signals;
+    sigset_t wait_mask;
+    install_serve_signals(&signals, &wait_mask); /* 워커를 만드는 server_create 보다 먼저 */
     Server *server = server_create(engine, &server_options, message);
+    int code = CLI_EXIT_OK;
     if (server == NULL) {
         fprintf(err, "minidb: %s\n", message);
-        engine_close(engine);
-        return CLI_EXIT_USAGE;
+        code = CLI_EXIT_USAGE;
+    } else {
+        serve_until_stopped(server, &server_options, &wait_mask, out);
     }
-    fprintf(out, "minidb: listening on port %d (workers %d, queue %d)\n", server_port(server),
-            server_options.worker_count, server_options.queue_capacity);
-    fflush(out);
-    server_run(server);
     server_destroy(server);
     engine_close(engine);
-    return CLI_EXIT_OK;
+    restore_serve_signals(&signals);
+    return code;
 }
 
 /* ---- 진입점 ---- */

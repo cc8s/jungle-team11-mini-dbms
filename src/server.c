@@ -14,6 +14,7 @@
 
 #include "http.h"
 #include "json.h"
+#include "server_internal.h"
 #include "threadpool.h"
 
 #define DEFAULT_WORKER_COUNT 4
@@ -31,20 +32,6 @@
 #define DRAIN_LIMIT (2 * HTTP_REQUEST_BUFFER_SIZE) /* 닫기 전에 버리는 최대 바이트 */
 #define DRAIN_FALLBACK_SIZE 512
 #define NS_PER_MS 1000000
-
-struct Server {
-    Engine *engine;
-    ServerOptions options;
-    int listen_fd;
-    int wake_pipe[2];   /* server_stop 이 [1] 에 쓰면 poll 중인 accept 루프가 [0] 으로 깨어난다 */
-    ThreadPool *pool;
-    atomic_bool is_stopping;
-    /* /stats 카운터. 워커 여러 개와 accept 스레드가 동시에 올리므로 원자 변수 */
-    atomic_llong requests_total; /* 워커가 응답한 요청 (상대가 먼저 끊은 연결 제외) */
-    atomic_llong errors_total;   /* 그중 상태 코드 400 이상 */
-    atomic_llong rejected_total; /* 큐가 가득 차 503 으로 돌려보낸 연결 */
-    struct timespec started_at;  /* 만든 뒤 바뀌지 않음 */
-};
 
 /* 응답 하나를 보낼 곳: 카운터를 올릴 서버와 연결 fd */
 typedef struct {
@@ -499,6 +486,7 @@ Server *server_create(Engine *engine, const ServerOptions *options, char out_mes
     atomic_init(&server->requests_total, 0);
     atomic_init(&server->errors_total, 0);
     atomic_init(&server->rejected_total, 0);
+    atomic_init(&server->accepted_total, 0);
     clock_gettime(CLOCK_MONOTONIC, &server->started_at);
     if (create_resources(server, out_message))
         return server;
@@ -540,6 +528,7 @@ static void accept_one(Server *server)
             fprintf(stderr, "minidb: accept failed: %s\n", strerror(errno));
         return;
     }
+    atomic_fetch_add(&server->accepted_total, 1);
     if (!threadpool_submit(server->pool, fd)) {
         Connection rejected = {server, fd};
         send_http_error(&rejected, HTTP_STATUS_SERVICE_UNAVAILABLE, "server is busy, retry later",
@@ -550,6 +539,30 @@ static void accept_one(Server *server)
     }
 }
 
+static bool is_stop_requested(const Server *server)
+{
+    return atomic_load(&server->is_stopping) ||
+           (server->stop_flag != NULL && *server->stop_flag != 0);
+}
+
+/* 시그널을 지켜보면 ppoll: 기다리는 동안에만 wait_mask (SIGINT/SIGTERM 풀림) 를 적용한다.
+ * 마스크 교체와 대기가 한 번에 일어나서, 확인과 대기 사이에 온 시그널도 놓치지 않는다
+ * (그 사이에 온 시그널은 막혀 있다가 ppoll 에 들어가는 순간 전달되어 EINTR 로 깨운다) */
+static int wait_for_event(Server *server, struct pollfd fds[POLL_FD_COUNT])
+{
+    if (server->has_wait_mask)
+        return ppoll(fds, POLL_FD_COUNT, NULL, &server->wait_mask);
+    return poll(fds, POLL_FD_COUNT, -1);
+}
+
+void server_watch_signals(Server *server, const sigset_t *wait_mask,
+                          volatile sig_atomic_t *stop_flag)
+{
+    server->wait_mask = *wait_mask;
+    server->has_wait_mask = true;
+    server->stop_flag = stop_flag;
+}
+
 /* listen 소켓과 깨우기 파이프를 같이 기다린다. accept 에 그냥 막혀 있으면 다른 스레드가 멈출 방법이
  * 없어서 (close 로 깨우는 것은 경쟁 상태가 있다) self-pipe 를 쓴다 */
 void server_run(Server *server)
@@ -558,9 +571,9 @@ void server_run(Server *server)
         [POLL_LISTEN] = {.fd = server->listen_fd, .events = POLLIN},
         [POLL_WAKE] = {.fd = server->wake_pipe[0], .events = POLLIN},
     };
-    while (!atomic_load(&server->is_stopping)) {
-        if (poll(fds, POLL_FD_COUNT, -1) < 0) {
-            if (errno != EINTR)
+    while (!is_stop_requested(server)) {
+        if (wait_for_event(server, fds) < 0) {
+            if (errno != EINTR) /* EINTR: 시그널. 루프 조건에서 stop_flag 를 본다 */
                 fprintf(stderr, "minidb: poll failed: %s\n", strerror(errno));
             continue;
         }
