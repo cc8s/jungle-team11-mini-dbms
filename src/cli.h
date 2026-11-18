@@ -5,6 +5,7 @@
  *
  *   ./minidb [-s schema_dir] [-d data_dir] query.sql   파일의 문장을 차례로 실행
  *   ./minidb [-s schema_dir] [-d data_dir]             터미널이면 REPL, 파이프면 stdin 전체 실행
+ *   -n  인덱스 끄기 (모든 SELECT 를 선형 탐색)   -t  탐색 방법·확인한 행 수·실행 시간 출력
  *
  * 한 문장이 실패해도 다음 문장을 계속 실행한다. 오류가 하나라도 있으면 종료 코드 1. */
 
