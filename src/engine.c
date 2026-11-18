@@ -1,12 +1,15 @@
 #include "engine.h"
 
 #include <dirent.h>
+#include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "engine_internal.h"
 #include "executor.h"
 #include "parser.h"
 #include "table.h"
@@ -16,13 +19,33 @@
 #define MS_PER_SECOND 1000.0
 #define NS_PER_MS 1000000.0
 
+/* 락 방식은 컴파일 옵션으로 고른다 (make LOCK_MODE=GLOBAL|TABLE_RW → -DLOCK_MODE_<이름>).
+ *   GLOBAL   실행 단계 전체를 엔진 뮤텍스 하나로. 정확성 기준선 (모든 요청이 한 줄로 선다)
+ *   TABLE_RW 테이블마다 RW 락 (기본값). SELECT 끼리는 동시에, 다른 테이블끼리도 동시에 */
+#if defined(LOCK_MODE_GLOBAL) && defined(LOCK_MODE_TABLE_RW)
+#error "define only one of LOCK_MODE_GLOBAL, LOCK_MODE_TABLE_RW"
+#endif
+#if defined(LOCK_MODE_GLOBAL)
+#define LOCK_MODE_NAME "GLOBAL"
+#else
+#define LOCK_MODE_NAME "TABLE_RW"
+#endif
+
 struct Engine {
     Table **tables;
     int table_count;
     int table_capacity;
     char (*warnings)[MAX_MESSAGE]; /* 열 때 생긴 경고 (헤더 복구). 테이블마다 최대 1 개 */
     int warning_count;
+    /* LOCK_MODE GLOBAL 에서 실행 단계 (executor_run) 를 감싸는 뮤텍스 하나. 전역 변수가 아니라
+     * 엔진마다 하나다. TABLE_RW 에서는 쓰지 않고 테이블의 RW 락을 쓴다 */
+    pthread_mutex_t execute_mutex;
+    bool has_execute_mutex;
+    atomic_llong lock_acquire_count; /* 실행 락을 잡은 횟수 (테스트 계측) */
+    atomic_int locks_held;           /* 지금 잡혀 있는 실행 락 수 */
 };
+
+typedef enum { LOCK_READ, LOCK_WRITE } LockKind;
 
 /* ---- 열기 ---- */
 
@@ -134,6 +157,11 @@ Engine *engine_open(const char *data_dir, ErrorCode *out_error, char out_message
         open_failure(ERR_INTERNAL, out_error, out_message, "out of memory");
         return NULL;
     }
+    engine->has_execute_mutex = pthread_mutex_init(&engine->execute_mutex, NULL) == 0;
+    if (!engine->has_execute_mutex) {
+        open_failure(ERR_INTERNAL, out_error, out_message, "cannot create the engine lock");
+        goto cleanup;
+    }
     DIR *dir = opendir(data_dir);
     if (dir == NULL) {
         open_failure(ERR_IO, out_error, out_message, "cannot open data directory '%s'", data_dir);
@@ -157,6 +185,8 @@ void engine_close(Engine *engine)
         table_close(engine->tables[i]);
     free(engine->tables);
     free(engine->warnings);
+    if (engine->has_execute_mutex)
+        pthread_mutex_destroy(&engine->execute_mutex);
     free(engine);
 }
 
@@ -175,6 +205,72 @@ const Table *engine_find_table(const Engine *engine, const char *name)
     return validator_find_table(engine->tables, engine->table_count, name);
 }
 
+int engine_table_count(const Engine *engine)
+{
+    return engine->table_count;
+}
+
+const Table *engine_table_at(const Engine *engine, int index)
+{
+    return engine->tables[index];
+}
+
+/* ---- 락 ----
+ * 락 방식에 따른 차이는 lock_table / unlock_table 두 함수에만 둔다. 부르는 쪽은 "이 테이블을 읽는다 /
+ * 쓴다" 만 말하고, 어떤 락이 잡히는지 모른다. 문장 하나는 테이블 하나만 쓰므로 락은 한 번에 하나뿐이고,
+ * 그래서 락 순서 문제 (교착) 가 생기지 않는다. */
+
+static void lock_table(Engine *engine, Table *table, LockKind kind)
+{
+#if defined(LOCK_MODE_GLOBAL)
+    (void)table;
+    (void)kind;
+    pthread_mutex_lock(&engine->execute_mutex);
+#else
+    if (kind == LOCK_WRITE)
+        table_lock_write(table);
+    else
+        table_lock_read(table);
+#endif
+    atomic_fetch_add_explicit(&engine->lock_acquire_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&engine->locks_held, 1, memory_order_relaxed);
+}
+
+static void unlock_table(Engine *engine, Table *table)
+{
+    atomic_fetch_sub_explicit(&engine->locks_held, 1, memory_order_relaxed);
+#if defined(LOCK_MODE_GLOBAL)
+    (void)table;
+    pthread_mutex_unlock(&engine->execute_mutex);
+#else
+    table_unlock(table);
+#endif
+}
+
+int32_t engine_record_count(Engine *engine, int index)
+{
+    Table *table = engine->tables[index];
+    lock_table(engine, table, LOCK_READ);
+    int32_t count = table_record_count(table);
+    unlock_table(engine, table);
+    return count;
+}
+
+const char *engine_lock_mode_name(void)
+{
+    return LOCK_MODE_NAME;
+}
+
+int64_t engine_lock_acquire_count(const Engine *engine)
+{
+    return atomic_load(&engine->lock_acquire_count);
+}
+
+int engine_locks_held(const Engine *engine)
+{
+    return atomic_load(&engine->locks_held);
+}
+
 /* ---- 실행 ---- */
 
 static double elapsed_ms_since(const struct timespec *start)
@@ -185,7 +281,11 @@ static double elapsed_ms_since(const struct timespec *start)
            (double)(end.tv_nsec - start->tv_nsec) / NS_PER_MS;
 }
 
-/* 파싱된 문장 하나를 검증하고 실행한다. 검증에서 실패하면 테이블을 건드리지 않는다 */
+/* 파싱된 문장 하나를 검증하고 실행한다. 검증에서 실패하면 테이블을 건드리지 않고 락도 잡지 않는다.
+ * 락 범위는 executor_run 하나: 검증은 열린 뒤 바뀌지 않는 스키마만 읽고, 파싱·결과 변환 (JSON) 은
+ * 호출한 쪽이 락 밖에서 한다. INSERT 는 쓰기 락 안에서 "id 발급 → 레코드 → 헤더 → 트리" 를,
+ * SELECT 는 읽기 락 안에서 "row_count 읽기 → 인덱스·스캔 → 레코드 복사" 를 한 덩어리로 한다.
+ * executor_run 은 에러여도 Result 로 돌아오므로 해제 경로는 바로 아래 한 곳뿐이다. */
 static Result execute_statement(Engine *engine, const Statement *stmt)
 {
     Plan plan;
@@ -193,17 +293,29 @@ static Result execute_statement(Engine *engine, const Statement *stmt)
     ErrorCode error = validator_check(stmt, engine->tables, engine->table_count, &plan, message);
     if (error != ERR_NONE)
         return result_error(error, stmt->line, "%s", message);
-    return executor_run(stmt, &plan);
+    LockKind kind = stmt->type == STMT_INSERT ? LOCK_WRITE : LOCK_READ;
+    lock_table(engine, plan.table, kind);
+    Result result = executor_run(stmt, &plan);
+    unlock_table(engine, plan.table);
+    return result;
+}
+
+/* API 경로: ? 자리를 params 로 채운 뒤 보통 문장처럼 검증·실행한다. 바인딩은 문장 구조만 바꾸므로
+ * 락 밖에서 한다 (개수가 안 맞는 요청은 락을 잡지 않고 끝난다) */
+static Result bind_and_execute(Engine *engine, Statement *stmt, const Value *params,
+                               int param_count)
+{
+    char message[MAX_MESSAGE];
+    ErrorCode error = validator_bind_params(stmt, params, param_count, message);
+    if (error != ERR_NONE)
+        return result_error(error, stmt->line, "%s", message);
+    return execute_statement(engine, stmt);
 }
 
 Result engine_execute(Engine *engine, const char *sql, const Value *params, int param_count)
 {
-    (void)params;
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    if (param_count > 0) /* TODO(S42): 바인딩 */
-        return result_error(ERR_UNSUPPORTED, 0, "parameter binding is not supported yet");
-
     Statement stmt;
     ParseError parse_error;
     Result result;
@@ -211,7 +323,7 @@ Result engine_execute(Engine *engine, const char *sql, const Value *params, int 
     if (error != ERR_NONE)
         result = result_error(error, parse_error.line, "%s", parse_error.message);
     else
-        result = execute_statement(engine, &stmt);
+        result = bind_and_execute(engine, &stmt, params, param_count);
     statement_free(&stmt);
     result.elapsed_ms = elapsed_ms_since(&start);
     return result;

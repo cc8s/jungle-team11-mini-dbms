@@ -5,6 +5,8 @@
  * 테스트가 파일로는 만들 수 없는 상태 (next_id = INT32_MAX 인 일관된 헤더처럼 수십 GB 가 필요한 것) 를
  * 메모리에서 직접 만들 때 쓴다. */
 
+#include <pthread.h>
+
 #include "btree.h"
 #include "table.h"
 
@@ -17,6 +19,9 @@ struct Table {
     double index_build_ms;               /* 재구축 (복구 포함) 에 걸린 시간 */
     bool has_recovery;                   /* 열 때 헤더를 바로잡았는지 */
     TableRecovery recovery;
+    /* 테이블 단위 RW 락 (쓰기 우선). 레코드 영역·헤더 카운터·인덱스를 함께 보호한다 */
+    pthread_rwlock_t rwlock;
+    bool has_rwlock;
 };
 
 #endif

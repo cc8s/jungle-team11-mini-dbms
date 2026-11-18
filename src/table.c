@@ -274,6 +274,21 @@ static void compute_column_offsets(Table *table)
 
 static ErrorCode load_index(Table *table, off_t file_size);
 
+/* 쓰기 우선 RW 락을 만든다. glibc 기본값 (읽기 우선) 은 읽기가 끊이지 않으면 쓰기가 영영 못 들어간다.
+ * PREFER_WRITER_NONRECURSIVE 는 "기다리는 쓰기가 있으면 새 읽기를 막는다" 이고, 그 대가로 같은
+ * 스레드가 읽기 락을 겹쳐 잡으면 교착될 수 있다 (엔진은 문장 하나에 락 하나만 잡으므로 괜찮다) */
+static bool init_rwlock(pthread_rwlock_t *rwlock)
+{
+    pthread_rwlockattr_t attr;
+    if (pthread_rwlockattr_init(&attr) != 0)
+        return false;
+    bool is_ok =
+        pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP) == 0 &&
+        pthread_rwlock_init(rwlock, &attr) == 0;
+    pthread_rwlockattr_destroy(&attr);
+    return is_ok;
+}
+
 Table *table_open(const char *path, ErrorCode *out_error)
 {
     Table *table = calloc(1, sizeof(*table));
@@ -283,7 +298,10 @@ Table *table_open(const char *path, ErrorCode *out_error)
     }
     table->fd = -1;
     off_t file_size = 0;
-    ErrorCode error = extract_table_name(path, table->name) ? ERR_NONE : ERR_CORRUPT;
+    table->has_rwlock = init_rwlock(&table->rwlock);
+    ErrorCode error = table->has_rwlock ? ERR_NONE : ERR_INTERNAL;
+    if (error == ERR_NONE)
+        error = extract_table_name(path, table->name) ? ERR_NONE : ERR_CORRUPT;
     if (error == ERR_NONE) {
         table->fd = open(path, O_RDWR);
         error = table->fd < 0 ? ERR_IO : ERR_NONE;
@@ -312,7 +330,26 @@ void table_close(Table *table)
     if (table->fd >= 0)
         close(table->fd);
     btree_destroy(table->index);
+    if (table->has_rwlock)
+        pthread_rwlock_destroy(&table->rwlock);
     free(table);
+}
+
+/* 실패 (EAGAIN: 읽기 락 수 한도, EDEADLK: 같은 스레드가 쓰기 락을 겹쳐 잡음) 는 엔진이 한 문장에
+ * 락 하나만 잡는 한 일어나지 않으므로 반환값을 따로 전하지 않는다 */
+void table_lock_read(Table *table)
+{
+    pthread_rwlock_rdlock(&table->rwlock);
+}
+
+void table_lock_write(Table *table)
+{
+    pthread_rwlock_wrlock(&table->rwlock);
+}
+
+void table_unlock(Table *table)
+{
+    pthread_rwlock_unlock(&table->rwlock);
 }
 
 bool table_find_recovery(const Table *table, TableRecovery *out_recovery)

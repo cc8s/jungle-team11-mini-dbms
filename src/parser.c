@@ -299,6 +299,11 @@ static bool find_operator(TokenType type, CompareOp *out_op)
 /* column op value 한 개. 컬럼은 왼쪽, 값은 오른쪽에만 온다 (계획서 3.7) */
 static ErrorCode parse_condition(Parser *parser, Statement *stmt, Condition *condition)
 {
+    /* 왼쪽은 컬럼 이름 자리다. ? 는 값 자리에만 쓸 수 있으므로 문법 에러 (이름을 바인딩하면 쿼리 구조가
+     * 바뀐다). 'kim' = name 같은 값은 문법은 맞지만 지원하지 않는 형태라 ERR_UNSUPPORTED */
+    if (current(parser)->type == TOK_PARAM)
+        return fail_at(parser, ERR_SYNTAX, current(parser),
+                       "placeholder '?' is only allowed where a value goes, not a column name");
     if (is_literal(current(parser)))
         return fail_at(parser, ERR_UNSUPPORTED, current(parser),
                        "the column must be on the left side of the comparison");

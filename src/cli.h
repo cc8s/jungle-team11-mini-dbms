@@ -4,7 +4,8 @@
 /* 명령줄 도구. main 은 cli_run(argc, argv, stdout, stderr) 만 부르고,
  * 테스트는 출력 스트림을 바꿔 끼워 같은 함수를 직접 부른다.
  *   minidb [-d <data_dir>] [-q] <file.sql>     SQL 파일 실행
- *   minidb [-d <data_dir>] init <schema.sql>  CREATE TABLE 한 문장으로 테이블 생성 */
+ *   minidb [-d <data_dir>] init <schema.sql>  CREATE TABLE 한 문장으로 테이블 생성
+ *   minidb [-d <data_dir>] serve <port> <threads> [queue_cap]  HTTP API 서버 */
 
 #include <stdio.h>
 
