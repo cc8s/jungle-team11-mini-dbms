@@ -1,0 +1,14 @@
+INSERT 1 (id = 1)
+ERROR: syntax error near 'FORM': expected FROM
+ERROR: syntax error near 'DELETE': expected INSERT or SELECT
+ERROR: id is assigned automatically
+ERROR: value too long for column 'name' (max 32 bytes)
+ERROR: column 'age' expects INT
+ERROR: table 'users' expects 3 values (id is automatic), got 2
+ERROR: unknown column 'phone' in table 'users'
+ERROR: table 'missing_table' does not exist
+INSERT 1 (id = 2)
+id | name
+1 | first
+2 | it's ok
+(2 rows)
