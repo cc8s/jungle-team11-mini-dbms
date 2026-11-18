@@ -284,6 +284,248 @@ static void test_writes_to_different_tables_do_not_wait(void)
     test_db_destroy(&db);
 }
 
+/* ==== S41 동시성 부하 ====
+ * 행이 스스로 검증되게 만든다: 스레드 t 의 seq 번째 INSERT 는 name = "t<t>-<seq>", tag = t * 1000000 + seq.
+ * id 는 엔진이 쓰기 락 안에서 발급하므로 클라이언트가 미리 알 수 없다. 대신 같은 행의 name 과 tag 가
+ * 서로 맞는지 보면, 반쯤 쓰인 레코드 (name 이 비었거나 tag 가 0) 는 걸린다. */
+
+#define LOAD_TABLE_SQL "CREATE TABLE users (id INT, name VARCHAR(16), tag INT);"
+#define LOAD_TWO_TABLES_SQL \
+    LOAD_TABLE_SQL "CREATE TABLE orders (id INT, name VARCHAR(16), tag INT);"
+#define TAG_THREAD_FACTOR 1000000
+#define LOAD_SQL_SIZE 128
+#define LOAD_NAME_SIZE 32
+#define ID_COLUMN 0
+#define NAME_COLUMN 1
+#define TAG_COLUMN 2
+
+#define T41_THREADS 8
+#define T41_INSERTS 10000
+#define MIXED_INSERTERS 2
+#define MIXED_READERS 6
+#define MIXED_INSERTS 2000
+#define TWO_TABLE_THREADS 4 /* 테이블마다 */
+#define TWO_TABLE_INSERTS 2000
+
+typedef struct {
+    Engine *engine;
+    const char *table;
+    int thread_no;
+    int count;
+    int32_t *ids; /* seq 번째 INSERT 가 받은 id */
+} Inserter;
+
+static void *run_inserter(void *arg)
+{
+    Inserter *inserter = arg;
+    char sql[LOAD_SQL_SIZE];
+    for (int seq = 0; seq < inserter->count; seq++) {
+        snprintf(sql, sizeof(sql), "INSERT INTO %s VALUES ('t%d-%d', %d);", inserter->table,
+                 inserter->thread_no, seq, inserter->thread_no * TAG_THREAD_FACTOR + seq);
+        Result result = engine_execute(inserter->engine, sql, NULL, 0);
+        CHECK(result.error == ERR_NONE);
+        inserter->ids[seq] = result.last_insert_id;
+        result_free(&result);
+    }
+    return NULL;
+}
+
+/* 스레드 thread_count 개가 table 에 count 개씩 넣을 준비를 한다 (ids 는 스레드마다 malloc) */
+static void prepare_inserters(Inserter *inserters, int thread_count, Engine *engine,
+                              const char *table, int count)
+{
+    for (int i = 0; i < thread_count; i++) {
+        inserters[i] = (Inserter){ .engine = engine, .table = table, .thread_no = i,
+                                   .count = count, .ids = calloc((size_t)count, sizeof(int32_t)) };
+        CHECK(inserters[i].ids != NULL);
+    }
+}
+
+/* 받은 id 를 모두 모으면 1..thread_count*count 가 정확히 한 번씩 나와야 한다 (중복·빈 곳 없음) */
+static void check_ids_complete(Inserter *inserters, int thread_count)
+{
+    int total = thread_count * inserters[0].count;
+    bool *seen = calloc((size_t)total + 1, sizeof(bool));
+    CHECK(seen != NULL);
+    for (int i = 0; i < thread_count; i++) {
+        for (int seq = 0; seq < inserters[i].count; seq++) {
+            int32_t id = inserters[i].ids[seq];
+            CHECK(id >= 1 && id <= total);
+            CHECK(!seen[id]);
+            seen[id] = true;
+        }
+    }
+    free(seen); /* 개수가 total 이고 중복이 없으므로 1..total 이 모두 나왔다 */
+}
+
+static void free_inserters(Inserter *inserters, int thread_count)
+{
+    for (int i = 0; i < thread_count; i++)
+        free(inserters[i].ids);
+}
+
+/* row 행이 온전한지: id 는 위치 + 1 (빈 곳 없이 이어짐), 컬럼이 3 개면 name 이 tag 와 맞는다 */
+static void check_row(const Result *result, int64_t row)
+{
+    CHECK(result_get_int(result, row, ID_COLUMN) == row + 1);
+    if (result->column_count == 1)
+        return;
+    int32_t tag = result_get_int(result, row, TAG_COLUMN);
+    size_t len = 0;
+    const char *name = result_get_str(result, row, NAME_COLUMN, &len);
+    char actual[LOAD_NAME_SIZE] = { 0 };
+    memcpy(actual, name, len < sizeof(actual) - 1 ? len : sizeof(actual) - 1);
+    char expected[LOAD_NAME_SIZE];
+    snprintf(expected, sizeof(expected), "t%d-%d", tag / TAG_THREAD_FACTOR,
+             tag % TAG_THREAD_FACTOR);
+    CHECK_STR_EQ(actual, expected);
+}
+
+/* sql 을 실행해 모든 행을 검사하고 행 수를 돌려준다 */
+static int64_t select_and_check(Engine *engine, const char *sql)
+{
+    Result result = engine_execute(engine, sql, NULL, 0);
+    CHECK(result.error == ERR_NONE);
+    for (int64_t row = 0; row < result.row_count; row++)
+        check_row(&result, row);
+    int64_t count = result.row_count;
+    result_free(&result);
+    return count;
+}
+
+/* ---- T41-01, T41-02 ---- */
+
+static void start_inserters(pthread_t *threads, Inserter *inserters, int thread_count)
+{
+    for (int i = 0; i < thread_count; i++)
+        threads[i] = start_thread(run_inserter, &inserters[i]);
+}
+
+static void join_all(pthread_t *threads, int thread_count)
+{
+    for (int i = 0; i < thread_count; i++)
+        CHECK(pthread_join(threads[i], NULL) == 0);
+}
+
+/* T41-01, T41-02 */
+static void test_parallel_inserts_get_unique_ids(void)
+{
+    TestDb db = open_db(LOAD_TABLE_SQL);
+    Inserter inserters[T41_THREADS];
+    pthread_t threads[T41_THREADS];
+    prepare_inserters(inserters, T41_THREADS, db.engine, "users", T41_INSERTS);
+    start_inserters(threads, inserters, T41_THREADS);
+    join_all(threads, T41_THREADS);
+
+    int total = T41_THREADS * T41_INSERTS;
+    check_ids_complete(inserters, T41_THREADS);
+    CHECK(engine_record_count(db.engine, 0) == total);
+    CHECK(select_and_check(db.engine, "SELECT * FROM users;") == total);
+    free_inserters(inserters, T41_THREADS);
+
+    test_db_reopen(&db); /* T41-02: 헤더와 파일이 맞아서 복구 없이 같은 인덱스가 재구축된다 */
+    CHECK(db.engine != NULL);
+    CHECK(engine_warning_count(db.engine) == 0);
+    CHECK(btree_size(table_index(engine_find_table(db.engine, "users"))) == total);
+    CHECK(select_and_check(db.engine, "SELECT * FROM users WHERE id >= 1;") == total);
+    test_db_destroy(&db);
+}
+
+/* ---- T41-03, E41-01, E41-02 ---- */
+
+typedef struct {
+    Engine *engine;
+    const char *sql;
+    atomic_bool *is_inserting;
+    int64_t select_count;
+} Reader;
+
+/* INSERT 가 끝날 때까지 SELECT 를 반복한다. 행은 늘 온전하고 (E41-01), 행 수는 줄지 않는다 (E41-02).
+ * do-while 이라 INSERT 가 먼저 끝나도 한 번은 읽는다 */
+static void *run_reader(void *arg)
+{
+    Reader *reader = arg;
+    int64_t last_count = 0;
+    do {
+        int64_t count = select_and_check(reader->engine, reader->sql);
+        CHECK(count >= last_count);
+        last_count = count;
+        reader->select_count++;
+    } while (atomic_load(reader->is_inserting));
+    return NULL;
+}
+
+/* 읽기 경로를 섞는다: 인덱스 범위 (id 만 / 전체 컬럼), 선형 스캔 */
+static const char *const MIXED_READER_SQL[] = {
+    "SELECT id FROM users WHERE id >= 1;",
+    "SELECT * FROM users WHERE id >= 1;",
+    "SELECT * FROM users;",
+};
+#define MIXED_READER_SQL_COUNT ((int)(sizeof(MIXED_READER_SQL) / sizeof(MIXED_READER_SQL[0])))
+
+static void start_readers(pthread_t *threads, Reader *readers, Engine *engine,
+                          atomic_bool *is_inserting)
+{
+    for (int i = 0; i < MIXED_READERS; i++) {
+        readers[i] = (Reader){ .engine = engine, .is_inserting = is_inserting,
+                               .sql = MIXED_READER_SQL[i % MIXED_READER_SQL_COUNT] };
+        threads[i] = start_thread(run_reader, &readers[i]);
+    }
+}
+
+/* T41-03, E41-01, E41-02 */
+static void test_mixed_inserts_and_selects(void)
+{
+    TestDb db = open_db(LOAD_TABLE_SQL);
+    atomic_bool is_inserting;
+    atomic_init(&is_inserting, true);
+    Reader readers[MIXED_READERS];
+    pthread_t reader_threads[MIXED_READERS];
+    start_readers(reader_threads, readers, db.engine, &is_inserting);
+
+    Inserter inserters[MIXED_INSERTERS];
+    pthread_t inserter_threads[MIXED_INSERTERS];
+    prepare_inserters(inserters, MIXED_INSERTERS, db.engine, "users", MIXED_INSERTS);
+    start_inserters(inserter_threads, inserters, MIXED_INSERTERS);
+    join_all(inserter_threads, MIXED_INSERTERS);
+    atomic_store(&is_inserting, false);
+    join_all(reader_threads, MIXED_READERS);
+
+    check_ids_complete(inserters, MIXED_INSERTERS);
+    CHECK(select_and_check(db.engine, "SELECT * FROM users;") == MIXED_INSERTERS * MIXED_INSERTS);
+    for (int i = 0; i < MIXED_READERS; i++)
+        CHECK(readers[i].select_count >= 1);
+    free_inserters(inserters, MIXED_INSERTERS);
+    test_db_destroy(&db);
+}
+
+/* ---- E41-03 ---- */
+
+/* E41-03 */
+static void test_two_tables_get_independent_ids(void)
+{
+    TestDb db = open_db(LOAD_TWO_TABLES_SQL);
+    Inserter users[TWO_TABLE_THREADS];
+    Inserter orders[TWO_TABLE_THREADS];
+    pthread_t user_threads[TWO_TABLE_THREADS];
+    pthread_t order_threads[TWO_TABLE_THREADS];
+    prepare_inserters(users, TWO_TABLE_THREADS, db.engine, "users", TWO_TABLE_INSERTS);
+    prepare_inserters(orders, TWO_TABLE_THREADS, db.engine, "orders", TWO_TABLE_INSERTS);
+    start_inserters(user_threads, users, TWO_TABLE_THREADS);
+    start_inserters(order_threads, orders, TWO_TABLE_THREADS);
+    join_all(user_threads, TWO_TABLE_THREADS);
+    join_all(order_threads, TWO_TABLE_THREADS);
+
+    int per_table = TWO_TABLE_THREADS * TWO_TABLE_INSERTS;
+    check_ids_complete(users, TWO_TABLE_THREADS); /* 각 테이블이 1..per_table 을 따로 쓴다 */
+    check_ids_complete(orders, TWO_TABLE_THREADS);
+    CHECK(select_and_check(db.engine, "SELECT * FROM users;") == per_table);
+    CHECK(select_and_check(db.engine, "SELECT * FROM orders;") == per_table);
+    free_inserters(users, TWO_TABLE_THREADS);
+    free_inserters(orders, TWO_TABLE_THREADS);
+    test_db_destroy(&db);
+}
+
 int main(void)
 {
     printf("test_concurrency (LOCK_MODE %s)\n", engine_lock_mode_name());
@@ -293,6 +535,9 @@ int main(void)
     RUN(test_lock_released_after_io_error);
     RUN(test_waiting_writer_blocks_new_readers);
     RUN(test_writes_to_different_tables_do_not_wait);
+    RUN(test_parallel_inserts_get_unique_ids);
+    RUN(test_mixed_inserts_and_selects);
+    RUN(test_two_tables_get_independent_ids);
     TEST_DONE();
     return 0;
 }

@@ -32,6 +32,7 @@
 #define DRAIN_LIMIT (2 * HTTP_REQUEST_BUFFER_SIZE) /* 닫기 전에 버리는 최대 바이트 */
 #define DRAIN_FALLBACK_SIZE 512
 #define NS_PER_MS 1000000
+#define ERRNO_TEXT_SIZE 128
 
 /* 응답 하나를 보낼 곳: 카운터를 올릴 서버와 연결 fd */
 typedef struct {
@@ -424,14 +425,22 @@ static bool is_valid_options(const ServerOptions *options)
            options->read_timeout_ms > 0;
 }
 
+/* strerror 는 공유 정적 버퍼를 쓸 수 있어 스레드에 안전하지 않다. 호출한 쪽 버퍼를 받는 strerror_r 을 쓴다.
+ * _GNU_SOURCE 판은 buf 나 바뀌지 않는 문자열을 가리키는 포인터를 돌려주므로 반환값을 써야 한다 */
+static const char *errno_text(int error, char buf[ERRNO_TEXT_SIZE])
+{
+    return strerror_r(error, buf, ERRNO_TEXT_SIZE);
+}
+
 /* SO_REUSEADDR: 재시작 직후 TIME_WAIT 로 남은 포트에도 다시 bind 할 수 있게 한다
  * (다른 프로세스가 listen 중인 포트는 여전히 실패한다). accept 루프가 poll 뒤 accept 에서 막히지 않게
  * listen 소켓은 non-blocking 으로 둔다 (그 사이 연결이 사라지면 EAGAIN 으로 돌아온다) */
 static int open_listen_socket(int port, char out_message[MAX_MESSAGE])
 {
+    char reason[ERRNO_TEXT_SIZE];
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
-        snprintf(out_message, MAX_MESSAGE, "socket: %s", strerror(errno));
+        snprintf(out_message, MAX_MESSAGE, "socket: %s", errno_text(errno, reason));
         return -1;
     }
     int on = 1;
@@ -441,7 +450,7 @@ static int open_listen_socket(int port, char out_message[MAX_MESSAGE])
         bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         listen(fd, LISTEN_BACKLOG) != 0) {
         snprintf(out_message, MAX_MESSAGE, "cannot listen on port %d: %s", port,
-                 strerror(errno));
+                 errno_text(errno, reason));
         close(fd);
         return -1;
     }
@@ -453,8 +462,9 @@ static bool create_resources(Server *server, char out_message[MAX_MESSAGE])
     server->listen_fd = open_listen_socket(server->options.port, out_message);
     if (server->listen_fd < 0)
         return false;
+    char reason[ERRNO_TEXT_SIZE];
     if (pipe2(server->wake_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
-        snprintf(out_message, MAX_MESSAGE, "pipe: %s", strerror(errno));
+        snprintf(out_message, MAX_MESSAGE, "pipe: %s", errno_text(errno, reason));
         return false;
     }
     server->pool = threadpool_create(server->options.worker_count,
@@ -523,10 +533,11 @@ static void discard_available_input(int fd)
  * 일시적 실패 (EINTR, EAGAIN, 연결이 그새 끊김) 는 조용히, 자원 부족 (EMFILE 등) 은 로그 후 계속 */
 static void accept_one(Server *server)
 {
+    char reason[ERRNO_TEXT_SIZE];
     int fd = accept4(server->listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (fd < 0) {
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED)
-            fprintf(stderr, "minidb: accept failed: %s\n", strerror(errno));
+            fprintf(stderr, "minidb: accept failed: %s\n", errno_text(errno, reason));
         return;
     }
     atomic_fetch_add(&server->accepted_total, 1);
@@ -572,10 +583,11 @@ void server_run(Server *server)
         [POLL_LISTEN] = {.fd = server->listen_fd, .events = POLLIN},
         [POLL_WAKE] = {.fd = server->wake_pipe[0], .events = POLLIN},
     };
+    char reason[ERRNO_TEXT_SIZE];
     while (!is_stop_requested(server)) {
         if (wait_for_event(server, fds) < 0) {
             if (errno != EINTR) /* EINTR: 시그널. 루프 조건에서 stop_flag 를 본다 */
-                fprintf(stderr, "minidb: poll failed: %s\n", strerror(errno));
+                fprintf(stderr, "minidb: poll failed: %s\n", errno_text(errno, reason));
             continue;
         }
         if (fds[POLL_WAKE].revents != 0)

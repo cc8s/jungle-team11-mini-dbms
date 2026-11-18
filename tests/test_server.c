@@ -883,6 +883,56 @@ static void test_sigint_twice_shuts_down_cleanly(void)
     test_db_destroy(&db);
 }
 
+/* ---- S41 서버 경유 부하 ---- */
+
+#define MIXED_CLIENTS 16
+#define MIXED_REQUESTS 500
+#define MIXED_SELECT_EVERY 4 /* 네 번에 한 번은 SELECT (읽기 락과 쓰기 락이 섞이게) */
+#define SELECT_ONE_BODY "{\"sql\":\"SELECT * FROM users WHERE id = 1\"}"
+
+typedef struct {
+    int port;
+    int inserted; /* 200 을 받은 INSERT 수 */
+} MixedClient;
+
+/* 요청마다 새 연결 (서버는 응답 후 닫는다). 큐가 차면 503 이 정상이고, 그 INSERT 는 실행되지 않았다 */
+static void *run_mixed_client(void *arg)
+{
+    MixedClient *client = arg;
+    Response *response = malloc(sizeof(*response)); /* 64KB 라 스레드 스택 대신 힙에 */
+    CHECK(response != NULL);
+    for (int i = 0; i < MIXED_REQUESTS; i++) {
+        bool is_select = i % MIXED_SELECT_EVERY == 0;
+        post_query(client->port, is_select ? SELECT_ONE_BODY : INSERT_BODY, response);
+        CHECK(response->status == 200 || response->status == 503);
+        if (!is_select && response->status == 200)
+            client->inserted++;
+    }
+    free(response);
+    return NULL;
+}
+
+/* T41-04 */
+static void test_load_through_server(void)
+{
+    TestServer ts;
+    start_users_server(&ts);
+    MixedClient clients[MIXED_CLIENTS];
+    pthread_t threads[MIXED_CLIENTS];
+    for (int i = 0; i < MIXED_CLIENTS; i++) {
+        clients[i] = (MixedClient){ .port = ts.port };
+        CHECK(pthread_create(&threads[i], NULL, run_mixed_client, &clients[i]) == 0);
+    }
+    int inserted = 0;
+    for (int i = 0; i < MIXED_CLIENTS; i++) {
+        CHECK(pthread_join(threads[i], NULL) == 0);
+        inserted += clients[i].inserted;
+    }
+    CHECK(inserted > 0);
+    CHECK(engine_record_count(ts.db.engine, 0) == inserted); /* 성공한 INSERT 만 행이 됐다 */
+    stop_server(&ts);
+}
+
 int main(void)
 {
     printf("test_server\n");
@@ -915,6 +965,7 @@ int main(void)
     RUN(test_stop_while_insert_in_progress);
     RUN(test_stop_answers_queued_requests);
     RUN(test_sigint_twice_shuts_down_cleanly);
+    RUN(test_load_through_server);
     TEST_DONE();
     return 0;
 }

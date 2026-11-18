@@ -27,7 +27,7 @@ ASAN_LIB_OBJS := $(patsubst src/%.c, $(ASAN_DIR)/%.o, $(LIB_SRCS))
 ASAN_TESTS    := $(patsubst tests/%.c, $(ASAN_DIR)/tests/%, $(TEST_SRCS))
 
 # TSan 빌드 (데이터 레이스 검사). ASan 과 같이 쓸 수 없어서 디렉터리를 따로 쓴다
-TSAN_FLAGS    := -fsanitize=thread -fno-omit-frame-pointer
+TSAN_FLAGS    := -fsanitize=thread -fno-omit-frame-pointer -g -O1 # 뒤의 -O1 이 CFLAGS 의 -O2 를 덮는다
 TSAN_DIR      := build/tsan
 TSAN_LIB_OBJS := $(patsubst src/%.c, $(TSAN_DIR)/%.o, $(LIB_SRCS))
 TSAN_TESTS    := $(patsubst tests/%.c, $(TSAN_DIR)/tests/%, $(TEST_SRCS))
@@ -51,7 +51,7 @@ SLOW_TESTS_ENV := MINIDB_SLOW_TESTS=1
 BENCH       := build/bench/bench_index
 BENCH_SIZES ?=
 
-.PHONY: all test test-asan test-tsan test-global test-order test-slow bench run clean FORCE
+.PHONY: all test test-asan test-tsan test-global check-banned test-order test-slow bench run clean FORCE
 
 # 테스트 링크에만 쓰이는 오브젝트를 make 가 중간 파일로 보고 지우지 않게 한다 (매번 다시 빌드 방지)
 .SECONDARY: $(LIB_OBJS) $(ASAN_LIB_OBJS) $(TSAN_LIB_OBJS) $(GLOBAL_LIB_OBJS)
@@ -114,6 +114,10 @@ test-tsan: $(TSAN_TESTS)
 # 전체 테스트를 LOCK_MODE=GLOBAL 빌드로 다시 돌린다 (기본 make test 는 TABLE_RW)
 test-global: $(GLOBAL_TESTS)
 	@for t in $(GLOBAL_TESTS); do echo "== $$t"; ./$$t || exit 1; done
+
+# 전역 변수, 함수 안 static, strtok·strerror 같은 비재진입 함수가 src/ 에 없는지 grep 으로 점검한다
+check-banned:
+	@sh tools/check_banned.sh src
 
 test-order: $(ORDER_TESTS)
 	@for t in $(ORDER_TESTS); do echo "== $$t"; ./$$t || exit 1; done
