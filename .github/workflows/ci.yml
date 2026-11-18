@@ -13,6 +13,7 @@ jobs:
       - run: make
       - run: make test
       - run: make sqltest
+      - run: make servertest
 
   asan:
     runs-on: ubuntu-22.04
@@ -25,3 +26,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make tsan
+      - run: make servertest-tsan
