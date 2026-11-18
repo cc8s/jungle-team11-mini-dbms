@@ -136,8 +136,25 @@ static void test_empty(void)
     CHECK(tokenize_all(" \n\t ", t, 2) == 1 && t[0].type == TOKEN_EOF);
 }
 
+/* TC-TOK-009 EP: -- 줄 주석은 건너뛴다. 문자열 안의 -- 와 음수 -1 은 그대로 */
+static void test_line_comment(void)
+{
+    struct token t[8];
+
+    int n = tokenize_all("-- 처음\nSELECT -- 중간\n'a--b' -1 -- 끝", t, 8);
+    CHECK(n == 4);
+    CHECK(token_is_keyword(&t[0], "SELECT"));
+    CHECK(t[1].type == TOKEN_STRING);
+    CHECK_STR_EQ(t[1].text, "a--b");
+    CHECK(t[2].type == TOKEN_INT && t[2].int_value == -1);
+    CHECK(t[3].type == TOKEN_EOF);
+
+    CHECK(tokenize_all("-- 주석만", t, 8) == 1 && t[0].type == TOKEN_EOF);
+}
+
 int main(void)
 {
+    RUN(test_line_comment);
     RUN(test_select_statement);
     RUN(test_insert_symbols);
     RUN(test_string_escape);
