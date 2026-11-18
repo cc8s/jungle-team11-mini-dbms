@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "parser.h"
@@ -10,6 +11,33 @@
 #define CLI_DEFAULT_SCHEMA_DIR "schema"
 #define CLI_DEFAULT_DATA_DIR   "data"
 #define CLI_READ_CHUNK         (64 * 1024)
+
+/* -t: 문장마다 탐색 방법과 실행 시간을 "-- ..." 주석 줄로 덧붙인다 (CLI 옵션이라 cli_main 만 바꾼다) */
+static bool g_show_stats = false;
+
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* 테이블을 처음 여는 문장은 열기(인덱스 재구성) 시간을 따로 보여 주고 질의 시간에서 뺀다 */
+static void print_stats(const struct result *res, double elapsed_ms, FILE *out)
+{
+    double query_ms = elapsed_ms - res->table_open_ms;
+
+    if (res->table_open_ms > 0) {
+        fprintf(out, "-- table opened in %.3f ms (index rebuilt)\n", res->table_open_ms);
+    }
+    if (res->type == RESULT_INSERT) {
+        fprintf(out, "-- %.3f ms\n", query_ms);
+        return;
+    }
+    fprintf(out, "-- %s, examined %zu rows, %.3f ms\n", result_plan_name(res->plan),
+            res->rows_examined, query_ms);
+}
 
 int cli_run_sql(struct executor *ex, const char *sql, FILE *out)
 {
@@ -26,12 +54,17 @@ int cli_run_sql(struct executor *ex, const char *sql, FILE *out)
         if (pr == PARSE_EMPTY) {
             break;
         }
+        double start = now_ms();
         if (pr == PARSE_ERROR || executor_execute(ex, &stmt, &res, err, sizeof(err)) < 0) {
             fprintf(out, "ERROR: %s\n", err);
             failures++;
             continue;
         }
+        double elapsed = now_ms() - start;
         result_print(&res, out);
+        if (g_show_stats) {
+            print_stats(&res, elapsed, out);
+        }
         result_free(&res);
     }
     return failures;
@@ -116,20 +149,29 @@ static int run_repl(struct executor *ex)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s [-s schema_dir] [-d data_dir] [query.sql]\n", prog);
+    fprintf(stderr,
+            "usage: %s [-s schema_dir] [-d data_dir] [-n] [-t] [query.sql]\n"
+            "  -n  인덱스를 쓰지 않는다 (모든 SELECT 를 선형 탐색)\n"
+            "  -t  문장마다 탐색 방법, 확인한 행 수, 실행 시간을 출력한다\n",
+            prog);
 }
 
 int cli_main(int argc, char **argv)
 {
     const char *schema_dir = CLI_DEFAULT_SCHEMA_DIR;
     const char *data_dir = CLI_DEFAULT_DATA_DIR;
+    bool use_index = true;
     int opt;
 
-    while ((opt = getopt(argc, argv, "s:d:h")) != -1) {
+    while ((opt = getopt(argc, argv, "s:d:nth")) != -1) {
         if (opt == 's') {
             schema_dir = optarg;
         } else if (opt == 'd') {
             data_dir = optarg;
+        } else if (opt == 'n') {
+            use_index = false;
+        } else if (opt == 't') {
+            g_show_stats = true;
         } else {
             usage(argv[0]);
             return opt == 'h' ? 0 : 2;
@@ -145,6 +187,7 @@ int cli_main(int argc, char **argv)
         fprintf(stderr, "path too long\n");
         return 2;
     }
+    ex.use_index = use_index;
 
     int failures;
     if (optind < argc || !isatty(STDIN_FILENO)) {
